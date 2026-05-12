@@ -1,0 +1,165 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.lance</groupId>
+        <artifactId>lance-spark-root</artifactId>
+        <version>0.4.0-beta.4</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>lance-spark-knn-4.2_2.13</artifactId>
+    <name>${project.artifactId}</name>
+    <description>
+        Phase 2 Catalyst integration for the indexed nearest-by join. Pattern-matches Spark 4.2's
+        NearestByJoin operator and rewrites it to call the staged probe/merge/materialize
+        pipeline from lance-spark-knn. Spark 4.2-SNAPSHOT-only (NearestByJoin was added in
+        SPARK-56395, post-4.1).
+    </description>
+    <packaging>jar</packaging>
+
+    <properties>
+        <scala.version>${scala213.version}</scala.version>
+        <scala.compat.version>${scala213.compat.version}</scala.compat.version>
+        <java.release>${java17.release}</java.release>
+        <!--
+          Pinned to 4.2.0-SNAPSHOT because NearestByJoin (SPARK-56395) only exists in master
+          today. When 4.2 ships, this can move to a release version. Until then, expect to
+          install Spark master locally with `./build/mvn install -DskipTests -pl sql/core -am`
+          before this module compiles.
+        -->
+        <spark.version>4.2.0-SNAPSHOT</spark.version>
+        <!--
+          Spark master ships with Arrow 19.x and a Spark-built `arrow-memory-netty-buffer-patch`
+          companion. lance-spark-base's default `arrow.version` is 15.0.2 which doesn't have
+          that artifact at all. Override the Arrow version pulled in transitively by knn so the
+          two classpaths converge on the same Arrow major.
+        -->
+        <arrow.version>19.0.0</arrow.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.lance</groupId>
+            <artifactId>lance-spark-knn_${scala.compat.version}</artifactId>
+            <version>${project.version}</version>
+            <exclusions>
+                <!--
+                  knn transitively pulls a `arrow-memory-netty-buffer-patch:15.0.2` that
+                  doesn't exist in central (the 15.x line predates that artifact). Spark master
+                  ships its own 19.x version. Exclude here and let Spark's `provided` deps
+                  resolve it on the runtime classpath.
+                -->
+                <exclusion>
+                    <groupId>org.apache.arrow</groupId>
+                    <artifactId>arrow-memory-netty-buffer-patch</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-sql_${scala.compat.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-catalyst_${scala.compat.version}</artifactId>
+            <version>${spark.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.lance</groupId>
+            <artifactId>lance-spark-knn_${scala.compat.version}</artifactId>
+            <version>${project.version}</version>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+        <!--
+          Runtime Lance connector for the e2e test. Tests against Spark 4.2-SNAPSHOT need a
+          DataSourceRegister at runtime; lance-spark-4.1_2.13 source compiles cleanly against
+          4.2 and the resulting jar runs on 4.2's DSv2 API. See README / BENCHMARK_RESULTS.md
+          for how to install:
+
+              ./mvnw install -pl lance-spark-4.1_2.13 -am -DskipTests \
+                -Dspark41.version=4.2.0-SNAPSHOT -Darrow183.version=19.0.0
+        -->
+        <dependency>
+            <groupId>org.lance</groupId>
+            <artifactId>lance-spark-4.1_${scala.compat.version}</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <!-- Same exec-plugin convention as lance-spark-knn_2.12: classpathScope=test so
+                 the runtime Lance connector resolves at exec time. See
+                 IndexedNearestByJoinSqlBenchmark for invocation. -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.1.0</version>
+                <configuration>
+                    <classpathScope>test</classpathScope>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>net.alchim31.maven</groupId>
+                <artifactId>scala-maven-plugin</artifactId>
+                <version>${scala-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>scala-compile-first</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>scala-test-compile</id>
+                        <phase>process-test-resources</phase>
+                        <goals>
+                            <goal>testCompile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <args>
+                        <arg>-feature</arg>
+                        <arg>-release</arg>
+                        <arg>${java.release}</arg>
+                    </args>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>${maven-compiler-plugin.version}</version>
+                <configuration>
+                    <release>${java.release}</release>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>test-jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+</project>
