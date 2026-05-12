@@ -189,9 +189,9 @@ object IndexedNearestJoin {
     //
     // The `references = child.outputSet` override on Merge/Materialize (see
     // `StagedPlans.scala`) blocks Catalyst's `ColumnPruning` from inserting
-    // `Project(Nil)` wrappers — that insertion was what caused the original 3-exec
-    // attempt (`882fcdb`) to crash with `AssertionError` / SIGSEGV in
-    // `ProbedLeftCodec.Decoder.decode` reading 0-field UnsafeRows (commit `2e2ba94`).
+    // `Project(Nil)` wrappers — that insertion was what caused an early 3-exec
+    // iteration to crash with `AssertionError` / SIGSEGV in
+    // `ProbedLeftCodec.Decoder.decode` reading 0-field UnsafeRows.
     LanceKnnStagedStrategy.ensureRegistered(spark)
 
     val leftSchema = left.schema
