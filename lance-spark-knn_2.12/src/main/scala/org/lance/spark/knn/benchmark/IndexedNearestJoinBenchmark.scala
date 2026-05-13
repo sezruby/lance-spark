@@ -65,11 +65,18 @@ import scala.collection.JavaConverters._
  *
  * == What this measures ==
  *
- * Five configurations, run at two scales (small: 100K×100, medium: 1M×1000):
+ * Six configurations, run at two scales (small: 100K×100, medium: 1M×1000):
  *
  *   A) Vanilla Spark cross-product   — `crossJoin` + custom L2 UDF + `row_number` window.
- *      The baseline a user would write today without our extension. This is what
- *      Spark's `RewriteNearestByJoin` rule lowers to.
+ *      The textbook way a user would express nearest-by-join in Spark 3.5 (no
+ *      `vector_l2_distance` until 4.2). Strictly slower than what `RewriteNearestByJoin`
+ *      actually does on Spark 4.2 (heap-K via `min_by_k`). Kept as the historical
+ *      headline-naive comparison.
+ *   A2) Heap-K-shape baseline        — `crossJoin` + L2 UDF + `groupBy(lid).agg(slice(
+ *      sort_array(collect_list(struct(dist, rid)), asc=true), 1, K))` + `inline()`. The
+ *      closest Spark 3.5 SQL expression of what Spark 4.2's `RewriteNearestByJoin` lowers
+ *      `NearestByJoin` to. Still O(|R| log |R|) per group on 3.5 (`min_by_k`'s O(|R| log K)
+ *      heap is 4.2-only); narrows the gap vs A but doesn't fully match 4.2-native.
  *   B) Phase 0/1 single-task probe   — `df.kNearestJoin(probeParallelism = 1)`. One task
  *      probes the whole right dataset per partition; Lance does the cross-fragment merge
  *      internally.
@@ -106,9 +113,11 @@ object IndexedNearestJoinBenchmark {
 
   /**
    * Each scale: (numRight, numLeft, numFragments, runBaseline). The vanilla-Spark crossJoin
-   * baseline is `O(|L|×|R|)` and gets impractical fast — at medium scale (1M × 1000 = 1B
-   * pairs) it's measured in tens of minutes per run, which would dominate the benchmark with
-   * a number we already established at small scale. So we only run baseline at small.
+   * baseline is `O(|L|×|R|)`. At medium scale (1M × 1000 = 1B pairs) it's measured in tens
+   * of minutes per run on a typical 8-core executor; on a wider cluster (8 × 8c/32g, the
+   * current sizing) it's tractable but still slow — flip `runBaseline = true` and budget
+   * extra cluster time accordingly. The default is "true at both scales" so the published
+   * speedup is always against an actual measured number rather than an extrapolated one.
    */
   private case class Scale(
       name: String,
@@ -121,7 +130,28 @@ object IndexedNearestJoinBenchmark {
   private val Small =
     Scale("small", numRight = 100000, numLeft = 100, numFragments = 4, runBaseline = true)
   private val Medium =
-    Scale("medium", numRight = 1000000, numLeft = 1000, numFragments = 8, runBaseline = false)
+    Scale("medium", numRight = 1000000, numLeft = 1000, numFragments = 8, runBaseline = true)
+
+  /**
+   * Sampling sweep + ground-truth scales for the medium-scale baseline extrapolation
+   * methodology. Cross-product `O(|L|·|R|·dim)` is genuinely linear in |R| and |L|
+   * separately (distance compute over a fixed number of pairs), so a sampled |R| sweep
+   * with fixed |L|, plus one |R|=full × |L|=reduced ground-truth, lets us extrapolate the
+   * full medium baseline number cheaply (~30 min cluster total) without spending
+   * 1+ hour/iter on the full 1B-pair cross-product.
+   */
+  private val SampleR10K =
+    Scale("sample_r10k", numRight = 10000, numLeft = 1000, numFragments = 8, runBaseline = true)
+  private val SampleR50K =
+    Scale("sample_r50k", numRight = 50000, numLeft = 1000, numFragments = 8, runBaseline = true)
+  private val SampleR100K =
+    Scale("sample_r100k", numRight = 100000, numLeft = 1000, numFragments = 8, runBaseline = true)
+  private val SampleR200K =
+    Scale("sample_r200k", numRight = 200000, numLeft = 1000, numFragments = 8, runBaseline = true)
+
+  /** Ground-truth at full |R|=1M but reduced |L|=100 — keeps |L|·|R| at 100M pairs (10× small). */
+  private val MediumL100 =
+    Scale("medium_l100", numRight = 1000000, numLeft = 100, numFragments = 8, runBaseline = true)
 
   /** A single timing result. */
   private case class Result(scale: String, config: String, medianMs: Long, runs: Seq[Long]) {
@@ -133,6 +163,14 @@ object IndexedNearestJoinBenchmark {
     val scales = sys.env.getOrElse("BENCHMARK_SCALE", "both").toLowerCase(Locale.ROOT) match {
       case "small" => Seq(Small)
       case "medium" => Seq(Medium)
+      case "baseline_sweep" =>
+        // Sampling sweep for cross-product O(|R|) extrapolation. Each scale at fixed |L|=1000
+        // so the linear-in-|R| coefficient comes out clean. Add MediumL100 as the ground
+        // truth: full |R|=1M with reduced |L|=100, which validates the extrapolation
+        // independently (it should match `extrap @ |R|=1M / 10` since |L| linearly affects
+        // wall-clock too).
+        Seq(SampleR10K, SampleR50K, SampleR100K, SampleR200K, MediumL100)
+      case "medium_l100" => Seq(MediumL100)
       case _ => Seq(Small, Medium)
     }
     val clusterMode = sys.env.get("BENCH_CLUSTER_MODE").exists(_.equalsIgnoreCase("true"))
@@ -145,19 +183,38 @@ object IndexedNearestJoinBenchmark {
     dataDirOpt.foreach(p => println(s"Data root:    $p"))
     println()
 
+    // BENCH_DISABLE_AQE=true turns off AQE for the whole benchmark run. Useful when
+    // benchmarking the cross-product baseline at scale, because AQE coalesces the
+    // post-shuffle partition count down (advisoryPartitionSizeInBytes default 64MB →
+    // a small shuffle gets squeezed to ~8 partitions even on a 64-core cluster), which
+    // throttles parallelism for downstream compute-heavy stages like the per-`lid`
+    // top-K aggregation. With AQE off, post-shuffle parallelism stays at the configured
+    // `spark.sql.shuffle.partitions`, fully utilizing cluster cores. Indexed-path runs
+    // do want AQE on (the merge-side shuffle benefits from coalesce/skew handling), so
+    // this is opt-in per-run.
+    val disableAqe = sys.env.get("BENCH_DISABLE_AQE").exists(_.equalsIgnoreCase("true"))
+
     val builder = SparkSession
       .builder()
       .appName("indexed-nearest-by-join-benchmark")
       .config("spark.sql.crossJoin.enabled", "true")
-      .config("spark.sql.shuffle.partitions", "32")
+    // shuffle.partitions left as a runtime override (submit-script default for cluster runs;
+    // Spark default 200 for local). Was hardcoded here to 32 historically — that was throttling
+    // post-shuffle parallelism on wider clusters. For local runs we set it to a sane local
+    // value below so we don't shuffle to 200 partitions on a laptop.
     if (!clusterMode) {
+      builder.config("spark.sql.shuffle.partitions", "32")
       builder
         .master("local[*]")
         .config("spark.driver.bindAddress", "127.0.0.1")
         .config("spark.driver.host", "127.0.0.1")
     }
+    if (disableAqe) {
+      builder.config("spark.sql.adaptive.enabled", "false")
+    }
     val spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
+    if (disableAqe) println("[bench] AQE DISABLED for this run (BENCH_DISABLE_AQE=true)")
 
     // Use user-supplied shared path in cluster mode, otherwise a local temp dir.
     val (ownedTmpDir, dataRoot) = dataDirOpt match {
@@ -275,6 +332,7 @@ object IndexedNearestJoinBenchmark {
     val rightDf = spark.read.format("lance").load(rightUri)
 
     val baseline: Runnable = () => crossProductTopK(spark, left, rightUri, K)
+    val baselineMinByK: Runnable = () => crossProductMinByK(spark, left, rightUri, K)
     val phase01: Runnable = () =>
       left.kNearestJoin(
         right = rightDf,
@@ -318,27 +376,45 @@ object IndexedNearestJoinBenchmark {
       "C: Phase 1.5 (probeParallelism=4)" -> phase15_4,
       "D: Phase 1.5 (probeParallelism=8)" -> phase15_8,
       "E: Phase 1.5 (G=8, skew-balanced)" -> phase15_8_skew)
-    if (runBaseline) ("A: Spark crossJoin (baseline)" -> baseline) +: baseSeq else baseSeq
+    // BENCHMARK_INCLUDE_BASELINE_A=true to include the row_number-window baseline. Default
+    // off because at medium scale that plan shuffles |L|×|R| rows through a per-lid
+    // window — structurally bad for top-K (no partial aggregation, single-task per
+    // shuffle partition handles tens of GB of sorted data, runs hours). A2 (the heap-K
+    // shape) gets per-task partial aggregation and is the realistic baseline at scale.
+    val includeRowNumberBaseline =
+      sys.env.get("BENCHMARK_INCLUDE_BASELINE_A").exists(_.equalsIgnoreCase("true"))
+    if (runBaseline) {
+      val a2Seq = Seq("A2: crossJoin + L2 UDF + groupBy/sort_array(K)" -> baselineMinByK)
+      val aSeq =
+        if (includeRowNumberBaseline) Seq("A: crossJoin + L2 UDF + row_number window" -> baseline)
+        else Seq.empty
+      aSeq ++ a2Seq ++ baseSeq
+    } else {
+      baseSeq
+    }
   }
 
   /**
-   * Vanilla-Spark baseline: cross product + custom L2 UDF + `row_number` window per `lid`. This
-   * is the textbook way to express nearest-by-join in Spark today (Spark 3.5 doesn't have
-   * vector_l2_distance; that's a 4.2 addition). It's also what `RewriteNearestByJoin` lowers
-   * a `NearestByJoin` operator to under the hood — the apples-to-apples comparison.
+   * Naive vanilla-Spark baseline (config A): cross product + L2 UDF + `row_number` window per
+   * `lid`. The textbook way a user might first express nearest-by-join on Spark 3.5 (which
+   * doesn't have `vector_l2_distance` — that's a 4.2 addition). Strictly slower than the
+   * `min_by_k` heap-K shape that Spark 4.2's `RewriteNearestByJoin` actually produces; kept
+   * here as the headline-naive comparison and as a stable apples-to-apples reference vs.
+   * earlier benchmark runs.
+   *
+   * `repartitionRightForBaseline` expands the right-side partitioning beyond the natural
+   * Lance-fragment count so the cross-join compute stage gets enough tasks to use all
+   * cluster cores (otherwise stages fuse on Lance's 8-fragment partitioning and only 8
+   * tasks run at a time).
    */
   private def crossProductTopK(
       spark: SparkSession,
       left: DataFrame,
       rightUri: String,
       k: Int): DataFrame = {
-    val l2 = udf((a: Seq[Float], b: Seq[Float]) => {
-      var s = 0.0f
-      var i = 0
-      while (i < a.length) { val d = a(i) - b(i); s += d * d; i += 1 }
-      s
-    })
-    val right = spark.read.format("lance").load(rightUri).select("rid", "rvec")
+    val l2 = l2UdfFactory()
+    val right =
+      repartitionRightForBaseline(spark.read.format("lance").load(rightUri).select("rid", "rvec"))
     val crossed = left.crossJoin(right).withColumn("__dist", l2(col("lvec"), col("rvec")))
     val w = Window.partitionBy("lid").orderBy(col("__dist"))
     crossed.withColumn("__rank", row_number().over(w)).filter(col("__rank") <= k).select(
@@ -346,6 +422,67 @@ object IndexedNearestJoinBenchmark {
       "rid",
       "__dist")
   }
+
+  /**
+   * Expand right-side partitioning for the cross-product baselines. Lance reads produce
+   * one Spark partition per fragment (default 8 here); when the cross-join + UDF stage
+   * gets fused into a single stage it inherits that partitioning, capping wall-clock
+   * parallelism at fragment-count regardless of cluster cores. Repartition target is
+   * env-driven so the same code can run on different cluster widths; default 64 matches
+   * the 8 × 8c cluster shape (= cores).
+   */
+  private def repartitionRightForBaseline(df: DataFrame): DataFrame = {
+    val target = sys.env.get("BENCH_BASELINE_RIGHT_PARTITIONS").map(_.toInt).getOrElse(64)
+    if (target > 0) df.repartition(target) else df
+  }
+
+  /**
+   * Closer-to-RewriteNearestByJoin baseline (config A2): cross product + L2 UDF + groupBy
+   * + `sort_array(collect_list(struct(rid, dist)))` + `slice(_, 1, K)` + `inline()`. Spark
+   * 4.2's `RewriteNearestByJoin` lowers `NearestByJoin` to roughly:
+   *
+   *   Project(j.output)
+   *     +- Generate(Inline(_matches))
+   *        +- Aggregate [__qid], first(left.*) ++ min_by(struct(right.*), expr, K)
+   *           +- LEFT OUTER Join (no condition) — cross product
+   *
+   * `min_by(struct, expr, K)` (`MaxMinByK`, SPARK-55322) is Spark 4.2-only; it does
+   * `O(|R| log K)` per group via a bounded heap. On Spark 3.5 the closest expressible
+   * shape is `slice(sort_array(collect_list(struct(dist, rid)), asc=true), 1, K)`, which
+   * is `O(|R| log |R|)` per group — strictly slower than the 4.2-native lowering. Quoted
+   * here so the speedup-vs-baseline number reflects what's actually possible to express
+   * in Spark 3.5 SQL today, not the naive row_number form.
+   *
+   * We sort `struct(__dist, rid)` (distance first) so `sort_array` orders by distance
+   * ascending; the K smallest distances bubble to the front; `inline()` expands the
+   * K-element array into K rows.
+   */
+  private def crossProductMinByK(
+      spark: SparkSession,
+      left: DataFrame,
+      rightUri: String,
+      k: Int): DataFrame = {
+    val l2 = l2UdfFactory()
+    val right =
+      repartitionRightForBaseline(spark.read.format("lance").load(rightUri).select("rid", "rvec"))
+    val crossed = left.crossJoin(right).withColumn("__dist", l2(col("lvec"), col("rvec")))
+    crossed.groupBy("lid")
+      .agg(
+        slice(
+          sort_array(collect_list(struct(col("__dist"), col("rid"))), asc = true),
+          1,
+          k).as("__matches"))
+      .select(col("lid"), inline(col("__matches")).as(Seq("__dist", "rid")))
+      .select("lid", "rid", "__dist")
+  }
+
+  private def l2UdfFactory(): org.apache.spark.sql.expressions.UserDefinedFunction =
+    udf((a: Seq[Float], b: Seq[Float]) => {
+      var s = 0.0f
+      var i = 0
+      while (i < a.length) { val d = a(i) - b(i); s += d * d; i += 1 }
+      s
+    })
 
   // -- timing harness ----------------------------------------------------------------------
 
@@ -528,6 +665,10 @@ object IndexedNearestJoinBenchmark {
     println(divider)
 
     val configs = scaleOrder.flatMap(byScale(_).map(_.config)).distinct
+    // Use config "A:" (row_number window) as the headline reference, since it's the value
+    // historical numbers were quoted against. A2 (sort_array(K)) is reported as a separate
+    // row whose speedup-vs-A also shows in the table — that's how much an `min_by_k`-style
+    // rewrite would shrink the gap on Spark 3.5 SQL.
     val baselineByScale = scaleOrder.flatMap { s =>
       byScale(s).find(_.config.startsWith("A:")).map(b => s -> b.medianMs)
     }.toMap
@@ -546,9 +687,10 @@ object IndexedNearestJoinBenchmark {
       println(header.format(("" +: cellsSpeedup): _*))
     }
     println(divider)
-    println("Speedup is `baseline / config`. Higher = faster than vanilla Spark crossJoin.")
-    println("Medium scale skips the crossJoin baseline (1B pairs is impractical to bench locally);")
-    println("compare B vs. C/D/E within the medium column for fragment-grouping speedup.")
+    println(
+      "Speedup is `baseline(A) / config`. Higher = faster than the row_number-window baseline.")
+    println("A2 is the closer-to-RewriteNearestByJoin shape (sort_array(K) instead of full sort);")
+    println("compare A vs A2 to see how much the heap-K rewrite alone narrows the gap.")
   }
 
   private def deleteRecursively(f: java.io.File): Unit = {

@@ -189,16 +189,21 @@ object WikipediaKnnPerfBenchmark {
   // -- Spark session --------------------------------------------------------------------------
 
   private def buildSparkSession(): SparkSession = {
+    val disableAqe = sys.env.get("BENCH_DISABLE_AQE").exists(_.equalsIgnoreCase("true"))
     val b = SparkSession.builder().appName("wikipedia-knn-perf")
       .config("spark.sql.crossJoin.enabled", "true")
-      .config("spark.sql.shuffle.partitions", "32")
+    // shuffle.partitions: cluster runs use the submit-time value (default 128 on the
+    // current sizing); local runs get 32 to avoid 200-partition fanout on a laptop.
     if (!ClusterMode) {
-      b.master("local[*]")
+      b.config("spark.sql.shuffle.partitions", "32")
+        .master("local[*]")
         .config("spark.driver.bindAddress", "127.0.0.1")
         .config("spark.driver.host", "127.0.0.1")
     }
+    if (disableAqe) b.config("spark.sql.adaptive.enabled", "false")
     val s = b.getOrCreate()
     s.sparkContext.setLogLevel("WARN")
+    if (disableAqe) println("[wiki-perf] AQE DISABLED for this run (BENCH_DISABLE_AQE=true)")
     s
   }
 
@@ -355,6 +360,7 @@ object WikipediaKnnPerfBenchmark {
     val rightDf = spark.read.format("lance").load(rightUri)
 
     val baseline: RunFn = () => crossProductTopK(spark, leftDf, rightUri, K)
+    val baselineMinByK: RunFn = () => crossProductMinByK(spark, leftDf, rightUri, K)
     val phase01: RunFn = () =>
       leftDf.kNearestJoin(
         right = rightDf,
@@ -398,33 +404,105 @@ object WikipediaKnnPerfBenchmark {
       "C: Phase 1.5 (probeParallelism=4)" -> phase15_4,
       "D: Phase 1.5 (probeParallelism=8)" -> phase15_8,
       "E: Phase 1.5 (G=8, skew-balanced)" -> phase15_8_skew)
-    if (runBaseline) ("A: Spark crossJoin (baseline)" -> baseline) +: indexed else indexed
+    // WIKI_INCLUDE_BASELINE_A=true to include the row_number-window baseline. Default off
+    // because at medium scale (|R|=100K+, |L|=1000+) the row_number plan shuffles |L|×|R|
+    // rows through a per-lid window with no partial aggregation; runs hours. A2 (heap-K
+    // shape) gets per-task partial aggregation and is the realistic baseline at scale.
+    val includeRowNumberBaseline =
+      sys.env.get("WIKI_INCLUDE_BASELINE_A").exists(_.equalsIgnoreCase("true"))
+    if (runBaseline) {
+      val a2 = Seq("A2: crossJoin + L2 UDF + groupBy/sort_array(K)" -> baselineMinByK)
+      val a =
+        if (includeRowNumberBaseline)
+          Seq("A: crossJoin + L2 UDF + row_number window" -> baseline)
+        else Seq.empty
+      a ++ a2 ++ indexed
+    } else {
+      indexed
+    }
   }
 
   /**
-   * Vanilla-Spark baseline: cross product + L2 UDF + `row_number` window per `lid`. Same
-   * shape as `IndexedNearestJoinBenchmark.crossProductTopK`; what `RewriteNearestByJoin`
-   * lowers to if the indexed-path rule is disabled. The only difference is dim=1024 vs
-   * 128 in the synthetic benchmark.
+   * Naive vanilla-Spark baseline (config A): cross product + L2 UDF + `row_number` window
+   * per `lid`. The textbook way a user would express nearest-by-join in Spark 3.5 (no
+   * `vector_l2_distance` until 4.2). Strictly slower than what `RewriteNearestByJoin`
+   * actually does on Spark 4.2 (heap-K via `min_by_k`); kept as the historical
+   * headline-naive comparison and as a stable apples-to-apples reference vs. earlier
+   * benchmark runs. Same shape as `IndexedNearestJoinBenchmark.crossProductTopK`; only
+   * difference is dim=1024 vs 128 in the synthetic benchmark.
    */
   private def crossProductTopK(
       spark: SparkSession,
       left: DataFrame,
       rightUri: String,
       k: Int): DataFrame = {
-    val l2 = udf((a: Seq[Float], b: Seq[Float]) => {
-      var s = 0.0f
-      var i = 0
-      while (i < a.length) { val d = a(i) - b(i); s += d * d; i += 1 }
-      s
-    })
-    val right = spark.read.format("lance").load(rightUri).select("rid", "rvec")
+    val l2 = l2UdfFactory()
+    val right =
+      repartitionRightForBaseline(spark.read.format("lance").load(rightUri).select("rid", "rvec"))
     val crossed = left.crossJoin(right).withColumn("__dist", l2(col("lvec"), col("rvec")))
     val w = Window.partitionBy("lid").orderBy(col("__dist"))
     crossed.withColumn("__rank", row_number().over(w))
       .filter(col("__rank") <= k)
       .select("lid", "rid", "__dist")
   }
+
+  /**
+   * Expand right-side partitioning for the cross-product baselines so the cross-join
+   * compute stage gets enough tasks to use all cluster cores. Lance reads produce one
+   * partition per fragment; without repartitioning, the fused cross-join + UDF stage
+   * inherits that count and only fragment-many tasks run at a time.
+   */
+  private def repartitionRightForBaseline(df: DataFrame): DataFrame = {
+    val target = sys.env.get("BENCH_BASELINE_RIGHT_PARTITIONS").map(_.toInt).getOrElse(64)
+    if (target > 0) df.repartition(target) else df
+  }
+
+  /**
+   * Closer-to-RewriteNearestByJoin baseline (config A2): cross product + L2 UDF + groupBy
+   * + `sort_array(collect_list(struct(dist, rid)))` + `slice(_, 1, K)` + `inline()`. Spark
+   * 4.2's `RewriteNearestByJoin` lowers `NearestByJoin` to roughly:
+   *
+   *   Project(j.output)
+   *     +- Generate(Inline(_matches))
+   *        +- Aggregate [__qid], first(left.*) ++ min_by(struct(right.*), expr, K)
+   *           +- LEFT OUTER Join (no condition) — cross product
+   *
+   * `min_by(struct, expr, K)` (`MaxMinByK`, SPARK-55322) is Spark 4.2-only; it does
+   * `O(|R| log K)` per group via a bounded heap. On Spark 3.5 the closest expressible
+   * shape is `slice(sort_array(collect_list(struct(dist, rid)), asc=true), 1, K)`, which
+   * is `O(|R| log |R|)` per group — strictly slower than the 4.2-native lowering. Quoted
+   * here so the speedup-vs-baseline number reflects what's actually possible to express
+   * in Spark 3.5 SQL today, not the naive row_number form.
+   *
+   * Same shape as `IndexedNearestJoinBenchmark.crossProductMinByK`; only difference is
+   * dim=1024 vs 128 in the synthetic benchmark.
+   */
+  private def crossProductMinByK(
+      spark: SparkSession,
+      left: DataFrame,
+      rightUri: String,
+      k: Int): DataFrame = {
+    val l2 = l2UdfFactory()
+    val right =
+      repartitionRightForBaseline(spark.read.format("lance").load(rightUri).select("rid", "rvec"))
+    val crossed = left.crossJoin(right).withColumn("__dist", l2(col("lvec"), col("rvec")))
+    crossed.groupBy("lid")
+      .agg(
+        slice(
+          sort_array(collect_list(struct(col("__dist"), col("rid"))), asc = true),
+          1,
+          k).as("__matches"))
+      .select(col("lid"), inline(col("__matches")).as(Seq("__dist", "rid")))
+      .select("lid", "rid", "__dist")
+  }
+
+  private def l2UdfFactory(): org.apache.spark.sql.expressions.UserDefinedFunction =
+    udf((a: Seq[Float], b: Seq[Float]) => {
+      var s = 0.0f
+      var i = 0
+      while (i < a.length) { val d = a(i) - b(i); s += d * d; i += 1 }
+      s
+    })
 
   // -- oracle equivalence --------------------------------------------------------------------
 
