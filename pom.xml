@@ -130,11 +130,13 @@
 
     <modules>
         <module>lance-spark-base_2.12</module>
+        <module>lance-spark-knn_2.12</module>
         <module>lance-spark-3.5_2.12</module>
         <module>lance-spark-bundle-3.5_2.12</module>
         <module>lance-spark-3.4_2.12</module>
         <module>lance-spark-bundle-3.4_2.12</module>
         <module>lance-spark-base_2.13</module>
+        <module>lance-spark-knn_2.13</module>
         <module>lance-spark-3.5_2.13</module>
         <module>lance-spark-bundle-3.5_2.13</module>
         <module>lance-spark-3.4_2.13</module>
@@ -143,6 +145,7 @@
         <module>lance-spark-bundle-4.0_2.13</module>
         <module>lance-spark-4.1_2.13</module>
         <module>lance-spark-bundle-4.1_2.13</module>
+        <module>lance-spark-knn-4.2_2.13</module>
     </modules>
 
     <dependencyManagement>

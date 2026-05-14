@@ -1,0 +1,218 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.lance</groupId>
+        <artifactId>lance-spark-root</artifactId>
+        <version>0.4.0-beta.4</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>lance-spark-knn_2.12</artifactId>
+    <name>${project.artifactId}</name>
+    <description>Indexed nearest-neighbor join for Lance datasets in Spark</description>
+    <packaging>jar</packaging>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.lance</groupId>
+            <artifactId>lance-spark-base_2.12</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-sql_${scala.compat.version}</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.lance</groupId>
+            <artifactId>lance-spark-base_2.12</artifactId>
+            <version>${project.version}</version>
+            <type>test-jar</type>
+            <scope>test</scope>
+        </dependency>
+        <!--
+          See lance-spark-knn_2.13/pom.xml for rationale: the knn module is Spark-version-agnostic,
+          but tests need a concrete connector at runtime to register `format("lance")`.
+        -->
+        <dependency>
+            <groupId>org.lance</groupId>
+            <artifactId>lance-spark-3.5_2.12</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter</artifactId>
+            <version>${junit.version}</version>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>net.alchim31.maven</groupId>
+                <artifactId>scala-maven-plugin</artifactId>
+                <version>${scala-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>scala-compile-first</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>compile</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>scala-test-compile</id>
+                        <phase>process-test-resources</phase>
+                        <goals>
+                            <goal>testCompile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <args>
+                        <arg>-feature</arg>
+                    </args>
+                </configuration>
+            </plugin>
+            <!--
+              Benchmark runner (local). Activate the benchmark profile to get the right classpath:
+                MAVEN_OPTS="-Xmx12g" ./mvnw -pl lance-spark-knn_2.12 \
+                  exec:java -Pbenchmark \
+                  -Dexec.mainClass=org.lance.spark.knn.benchmark.IndexedNearestJoinBenchmark
+              The benchmark profile adds lance-spark-3.5 as a compile dep so format("lance")
+              registers at runtime. See the benchmark profile below for cluster/fat-JAR build.
+            -->
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.1.0</version>
+                <configuration>
+                    <!-- compile scope by default; benchmark profile overrides to include lance-spark-3.5 -->
+                    <classpathScope>compile</classpathScope>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-jar-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>test-jar</goal>
+                        </goals>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
+
+    <profiles>
+        <!--
+          benchmark profile — produces a self-contained fat JAR for cluster submission.
+
+          Build:
+            ./mvnw -pl lance-spark-knn_2.12 package -Pbenchmark -DskipTests
+            → target/lance-spark-knn_2.12-<version>-benchmark.jar
+
+          Local run (no cluster):
+            MAVEN_OPTS="-Xmx12g" ./mvnw -pl lance-spark-knn_2.12 \
+              exec:java -Pbenchmark \
+              -Dexec.mainClass=org.lance.spark.knn.benchmark.IndexedNearestJoinBenchmark
+
+          Cluster run (set BENCH_CLUSTER_MODE=true and BENCH_DATA_PATH=<shared-uri> in the job):
+            Upload the -benchmark.jar and submit via your cluster's job API.
+        -->
+        <profile>
+            <id>benchmark</id>
+            <dependencies>
+                <!--
+                  Pulls in the lance format DataSourceRegister (META-INF/services) so
+                  `format("lance")` resolves at runtime without a pre-installed connector.
+                  Compile scope so it's included in the shaded fat JAR.
+                -->
+                <dependency>
+                    <groupId>org.lance</groupId>
+                    <artifactId>lance-spark-3.5_2.12</artifactId>
+                    <version>${project.version}</version>
+                </dependency>
+            </dependencies>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.apache.maven.plugins</groupId>
+                        <artifactId>maven-shade-plugin</artifactId>
+                        <version>${maven-shade-plugin.version}</version>
+                        <executions>
+                            <execution>
+                                <id>benchmark-fat-jar</id>
+                                <goals>
+                                    <goal>shade</goal>
+                                </goals>
+                                <phase>package</phase>
+                                <configuration>
+                                    <shadedArtifactAttached>true</shadedArtifactAttached>
+                                    <shadedClassifierName>benchmark</shadedClassifierName>
+                                    <artifactSet>
+                                        <excludes>
+                                            <!-- Spark is provided by the cluster -->
+                                            <exclude>org.apache.spark:*</exclude>
+                                            <!-- Scala stdlib is provided by the cluster -->
+                                            <exclude>org.scala-lang:*</exclude>
+                                            <!-- Netty is provided by Spark -->
+                                            <exclude>io.netty:*</exclude>
+                                        </excludes>
+                                    </artifactSet>
+                                    <transformers>
+                                        <!-- Merge META-INF/services so DataSourceRegister fires -->
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer" />
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheNoticeResourceTransformer" />
+                                        <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                                            <mainClass>org.lance.spark.knn.benchmark.IndexedNearestJoinBenchmark</mainClass>
+                                        </transformer>
+                                    </transformers>
+                                    <filters>
+                                        <filter>
+                                            <artifact>*:*</artifact>
+                                            <excludes>
+                                                <exclude>LICENSE</exclude>
+                                                <exclude>META-INF/*.SF</exclude>
+                                                <exclude>META-INF/*.DSA</exclude>
+                                                <exclude>META-INF/*.RSA</exclude>
+                                                <!--
+                                                  Linux-x86_64 only: strip the other two
+                                                  lance-jni platforms and all non-linux-x86_64
+                                                  arrow-jni variants. CPD spark175 engine is
+                                                  Linux; keeping darwin-aarch64 + linux-aarch64
+                                                  bloats the fat JAR to 254 MB and trips the
+                                                  CPD ingress ~5-min PUT timeout.
+                                                -->
+                                                <exclude>nativelib/darwin-aarch64/**</exclude>
+                                                <exclude>nativelib/linux-aarch64/**</exclude>
+                                                <exclude>aarch_64/**</exclude>
+                                                <exclude>x86_64/*.dylib</exclude>
+                                                <exclude>x86_64/*.dll</exclude>
+                                            </excludes>
+                                        </filter>
+                                    </filters>
+                                </configuration>
+                            </execution>
+                        </executions>
+                    </plugin>
+                    <!-- Override exec plugin to use compile scope (benchmark is now in main) -->
+                    <plugin>
+                        <groupId>org.codehaus.mojo</groupId>
+                        <artifactId>exec-maven-plugin</artifactId>
+                        <version>3.1.0</version>
+                        <configuration>
+                            <classpathScope>compile</classpathScope>
+                        </configuration>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
+</project>
