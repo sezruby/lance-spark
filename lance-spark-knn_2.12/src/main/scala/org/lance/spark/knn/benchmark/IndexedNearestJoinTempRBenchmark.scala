@@ -224,6 +224,45 @@ object IndexedNearestJoinTempRBenchmark {
         }
         results += resultC
 
+        // ---- Config D: kNearestJoin extension's built-in non-Lance handling ----
+        // This is the actual code path users hit when they write
+        // `queries.kNearestJoin(parquetDf, ...)` after sezruby/lance-spark#2.
+        // The extension internally calls LanceKnnImplicits.materializeNonLanceR →
+        // LanceTempR.materialize → existing probe pipeline. Compared against B which
+        // does the same thing but with the materialization spelled out explicitly,
+        // (D - B) should be near zero — a sanity check on the extension's wiring.
+        val resultD = timeIt(scale.name, "D: kNearestJoin(parquetDf) — built-in temp", repeats) {
+          () =>
+            leftDf.kNearestJoin(
+              right = rightDfParquet,
+              leftVecCol = "lvec",
+              rightVecCol = "rvec",
+              k = K,
+              metric = "l2",
+              rightProjection = Some(Seq("rid")),
+              probeParallelism = 1)
+        }
+        results += resultD
+
+        // ---- Plan-shape dump for the actual code path ----
+        // Print the analyzed + executed plans for config D (the new built-in path) at
+        // the smallest scale only. Helps verify the temp-Lance materialization and the
+        // staged probe/merge/materialize pipeline appear as expected when users hit the
+        // sezruby/lance-spark#2 path through the public API.
+        if (scale.name == scales.head.name) {
+          println()
+          println("-- df.explain(true) for config D (kNearestJoin against parquet R) --")
+          val explainDf = leftDf.kNearestJoin(
+            right = rightDfParquet,
+            leftVecCol = "lvec",
+            rightVecCol = "rvec",
+            k = K,
+            metric = "l2",
+            rightProjection = Some(Seq("rid")),
+            probeParallelism = 1)
+          explainDf.explain(extended = true)
+        }
+
         leftDf.unpersist()
         println()
       }
