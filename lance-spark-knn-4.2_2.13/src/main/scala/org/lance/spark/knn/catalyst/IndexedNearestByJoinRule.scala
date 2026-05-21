@@ -13,6 +13,7 @@
  */
 package org.lance.spark.knn.catalyst
 
+import org.apache.spark.sql.{LanceKnnDatasetBridge, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeReference, AttributeSet, EqualTo, Expression, GreaterThan, GreaterThanOrEqual, In, IsNotNull, IsNull, LessThan, LessThanOrEqual, Literal, Not, Or, VectorCosineSimilarity, VectorInnerProduct, VectorL2Distance}
 import org.apache.spark.sql.catalyst.plans.{JoinType, LeftOuter, NearestByDirection, NearestByDistance, NearestBySimilarity}
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, LogicalPlan, NearestByJoin, Project, SubqueryAlias}
@@ -21,7 +22,7 @@ import org.apache.spark.sql.connector.catalog.Table
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
 import org.apache.spark.sql.types.{BooleanType, ByteType, DoubleType, FloatType, IntegerType, LongType, ShortType, StringType, StructField, StructType}
 import org.apache.spark.unsafe.types.UTF8String
-import org.lance.spark.knn.internal.{LanceMaterializeStage, LanceMergeStage, LanceProbeStage, Metric}
+import org.lance.spark.knn.internal.{LanceMaterializeStage, LanceMergeStage, LanceProbeStage, LanceTempR, Metric}
 import org.lance.spark.knn.internal.staged.{LanceMaterializeLogicalPlan, LanceMergeLogicalPlan, LanceProbeLogicalPlan, ProbedLeftCodec}
 
 /**
@@ -102,6 +103,22 @@ object IndexedNearestByJoinRule extends Rule[LogicalPlan] {
   val EnabledConfKey: String = "spark.lance.knn.indexedNearestByJoin.enabled"
 
   /**
+   * Configuration key that gates the per-query temp-Lance materialization for non-Lance
+   * right sides (sezruby/lance-spark#2). When enabled (and [[EnabledConfKey]] is also on),
+   * a `NearestByJoin` whose right side isn't a Lance scan triggers
+   * [[org.lance.spark.knn.internal.LanceTempR.materialize]] at rule-application time, then
+   * proceeds with the same staged-plan rewrite against the temp URI.
+   *
+   * Off by default. Two reasons to keep it opt-in:
+   *   1. The rule evaluates the right plan synchronously at analysis time — for large R
+   *      that's a meaningful cost users should consciously accept.
+   *   2. Cluster mode requires `spark.lance.knn.tempR.dir` to be set (see
+   *      [[LanceTempR.resolveScratchDir]]); a misconfigured cluster would fail with a
+   *      clear error message that's still better surfaced behind an explicit opt-in.
+   */
+  val TempRForSqlEnabledConfKey: String = "spark.lance.knn.tempRForSqlRule.enabled"
+
+  /**
    * IVF cluster count to visit per query. Higher = better recall, more compute. Default
    * (None) leaves Lance's index-default (typically 1).
    */
@@ -120,6 +137,7 @@ object IndexedNearestByJoinRule extends Rule[LogicalPlan] {
     }
     val nprobes = optInt(NprobesConfKey)
     val refineFactor = optInt(RefineFactorConfKey)
+    val tempRForSqlEnabled = conf.getConfString(TempRForSqlEnabledConfKey, "false").toBoolean
     plan.transformDown {
       case j @ NearestByJoin(left, right, joinType, true, k, rankingExpr, direction) =>
         rewriteIfApplicable(
@@ -131,7 +149,8 @@ object IndexedNearestByJoinRule extends Rule[LogicalPlan] {
           rankingExpr,
           direction,
           nprobes,
-          refineFactor).getOrElse(j)
+          refineFactor,
+          tempRForSqlEnabled).getOrElse(j)
     }
   }
 
@@ -164,10 +183,20 @@ object IndexedNearestByJoinRule extends Rule[LogicalPlan] {
       rankingExpr: Expression,
       direction: NearestByDirection,
       nprobes: Option[Int],
-      refineFactor: Option[Int]): Option[LogicalPlan] = {
+      refineFactor: Option[Int],
+      tempRForSqlEnabled: Boolean): Option[LogicalPlan] = {
     for {
-      lance <- unwrapLanceScan(right)
+      // Recognize the ranking BEFORE attempting the right-side resolution so we don't
+      // pay a temp-Lance materialization for queries that are going to fall through
+      // anyway (wrong direction, mixed-side rank expression, etc.).
       (metric, leftVecAttr, rightVecCol) <- recognizeRanking(rankingExpr, direction, left, right)
+      lance <- unwrapLanceScan(right).orElse {
+        if (tempRForSqlEnabled) {
+          materializeNonLanceR(right, rightVecCol)
+        } else {
+          None
+        }
+      }
     } yield {
       val leftVecIdx = left.output.indexWhere(_.exprId == leftVecAttr.exprId)
       require(leftVecIdx >= 0, s"left vector attr not found in left.output: $leftVecAttr")
@@ -419,6 +448,52 @@ object IndexedNearestByJoinRule extends Rule[LogicalPlan] {
     projectList.zip(childOut).forall {
       case (a: Attribute, c) => a.exprId == c.exprId
       case _ => false
+    }
+  }
+
+  /**
+   * Synthesise a [[LanceScanInfo]] for a non-Lance right plan by materializing it to a
+   * temp Lance dataset (sezruby/lance-spark#2). The materialization runs synchronously at
+   * rule-application time. Returns `None` if anything goes wrong — caller falls through
+   * to Spark's brute-force rewrite.
+   *
+   * The synthesised `output` reuses the ORIGINAL right plan's attribute references
+   * (`right.output`) — preserving `ExprId`s — so the top-level `Project(j.output, ...)`
+   * the rule emits stays attribute-resolved. The materialize stage reads from the temp
+   * Lance dataset (which has those columns by name plus the synthetic `_rid`) and binds
+   * the read-back rows back to those original attribute references.
+   */
+  private def materializeNonLanceR(
+      right: LogicalPlan,
+      rightVecCol: String): Option[LanceScanInfo] = {
+    try {
+      val spark = SparkSession.active
+      val rightDf = LanceKnnDatasetBridge.asDataFrame(spark, right)
+      val scratchDir = LanceTempR.resolveScratchDir(spark)
+      // Carry every right-side attribute the parent plan can reference. The probe
+      // pipeline's materialize stage projects from this set, so all of right.output
+      // must be present.
+      val projection: Seq[String] = right.output.map(_.name).filterNot(_ == rightVecCol)
+      val tempUri = LanceTempR.materialize(
+        right = rightDf,
+        vecCol = rightVecCol,
+        projection = projection,
+        scratchDir = scratchDir)
+      // Synthesise a LanceScanInfo: URI is the temp; version is None (per-query temp);
+      // output keeps the original right.output (preserving ExprIds for the top-level
+      // Project resolution); no prefilter (the temp already represents the FULLY
+      // evaluated right plan, so any source-side filters were applied during the write).
+      Some(
+        LanceScanInfo(
+          uri = tempUri,
+          version = None,
+          output = right.output,
+          prefilter = None))
+    } catch {
+      case _: Throwable =>
+        // Any failure (config missing in cluster mode, write fails, etc.) — fall through
+        // to Spark's brute-force rewrite. The user's query still runs, just slowly.
+        None
     }
   }
 
