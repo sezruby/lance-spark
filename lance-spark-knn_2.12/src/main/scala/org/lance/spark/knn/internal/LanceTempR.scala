@@ -123,6 +123,12 @@ private[knn] object LanceTempR {
     val projected: DataFrame = right.select(ridCol +: payloadCols: _*)
 
     projected.write.format("lance").save(tempUri)
+
+    // Register for query-scoped cleanup. Cleanup fires on SparkListenerApplicationEnd
+    // (when the SparkSession stops cleanly) and on JVM shutdown via a shutdown hook
+    // (covers crashes / hard kills). See LanceTempLifecycle.
+    LanceTempLifecycle.register(right.sparkSession, tempUri)
+
     tempUri
   }
 
