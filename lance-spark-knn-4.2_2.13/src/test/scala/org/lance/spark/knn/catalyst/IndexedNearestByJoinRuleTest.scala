@@ -290,6 +290,144 @@ class IndexedNearestByJoinRuleTest {
     assertSame(join, rewritten, "computed expression must refuse pushdown")
   }
 
+  // -- per-query temp-Lance path for non-Lance R (sezruby/lance-spark#2) --------------------
+
+  /**
+   * With `spark.lance.knn.tempRForSqlRule.enabled = true`, a non-Lance right side
+   * (here: a parquet-backed DataFrame) triggers per-query temp-Lance materialization
+   * inside the rule. The rule should rewrite to the same staged-plan tree it produces
+   * for Lance R, but with the probe pointed at the temp URI.
+   */
+  @Test def testTempRForSqlRewritesNonLanceR(): Unit = {
+    spark.conf.set(IndexedNearestByJoinRule.EnabledConfKey, "true")
+    spark.conf.set(IndexedNearestByJoinRule.TempRForSqlEnabledConfKey, "true")
+    try {
+      val left = trivialPlan("lid", "lvec")
+      // Right side: an analyzed parquet plan, not a Lance scan.
+      val parquetRight = parquetLikePlan(idCol = "rid", vecCol = "rvec")
+
+      val leftVec = left.output.find(_.name == "lvec").get
+      val rightVec = parquetRight.output.find(_.name == "rvec").get
+      val join = NearestByJoin(
+        left,
+        parquetRight,
+        Inner,
+        approx = true,
+        numResults = 5,
+        rankingExpression = VectorL2Distance(leftVec, rightVec),
+        direction = NearestByDistance)
+      val rewritten = IndexedNearestByJoinRule(join)
+      // Same shape assertion as the Lance-R happy path: Project wrapping the materialize node.
+      assertTrue(
+        rewritten.isInstanceOf[Project] &&
+          rewritten.asInstanceOf[Project].child.isInstanceOf[LanceMaterializeLogicalPlan],
+        s"expected rewrite to Project(LanceMaterialize(...)), got: $rewritten")
+      // The probe URI should point at a temp dir, not anything from the parquet relation.
+      val summary = expectRewritten(rewritten)
+      // No prefilter when the right side was materialized — the temp already represents
+      // the fully-evaluated plan.
+      assertEquals(None, summary.prefilter)
+    } finally {
+      spark.conf.unset(IndexedNearestByJoinRule.TempRForSqlEnabledConfKey)
+      spark.conf.unset(IndexedNearestByJoinRule.EnabledConfKey)
+    }
+  }
+
+  /**
+   * With the temp-R conf enabled but the rule itself disabled, a non-Lance right side still
+   * falls through. The materialize-and-rewrite path is gated on BOTH the main enabled flag
+   * AND the temp-R-for-SQL flag — turning on only one isn't enough.
+   */
+  @Test def testTempRForSqlRequiresMainEnabledFlag(): Unit = {
+    spark.conf.unset(IndexedNearestByJoinRule.EnabledConfKey) // main flag off
+    spark.conf.set(IndexedNearestByJoinRule.TempRForSqlEnabledConfKey, "true")
+    try {
+      val left = trivialPlan("lid", "lvec")
+      val parquetRight = parquetLikePlan(idCol = "rid", vecCol = "rvec")
+      val leftVec = left.output.find(_.name == "lvec").get
+      val rightVec = parquetRight.output.find(_.name == "rvec").get
+      val join = NearestByJoin(
+        left,
+        parquetRight,
+        Inner,
+        approx = true,
+        numResults = 5,
+        rankingExpression = VectorL2Distance(leftVec, rightVec),
+        direction = NearestByDistance)
+      val rewritten = IndexedNearestByJoinRule(join)
+      assertSame(
+        join,
+        rewritten,
+        "main enabled flag off → rule must not fire even with tempR enabled")
+    } finally {
+      spark.conf.unset(IndexedNearestByJoinRule.TempRForSqlEnabledConfKey)
+    }
+  }
+
+  /**
+   * Right side has a Lance-unsupported column type (MapType). Even with the temp-R conf
+   * enabled, the rule must fall through to brute-force rather than throw — Catalyst rules
+   * shouldn't fail the user's query when a fallback exists. Pin: schema check refuses,
+   * rewrite returns None, original NearestByJoin propagates.
+   */
+  @Test def testTempRForSqlFallsThroughOnUnsupportedSchema(): Unit = {
+    spark.conf.set(IndexedNearestByJoinRule.EnabledConfKey, "true")
+    spark.conf.set(IndexedNearestByJoinRule.TempRForSqlEnabledConfKey, "true")
+    try {
+      val left = trivialPlan("lid", "lvec")
+      val rightWithMap = parquetLikePlanWithMap(idCol = "rid", vecCol = "rvec")
+      val leftVec = left.output.find(_.name == "lvec").get
+      val rightVec = rightWithMap.output.find(_.name == "rvec").get
+      val join = NearestByJoin(
+        left,
+        rightWithMap,
+        Inner,
+        approx = true,
+        numResults = 5,
+        rankingExpression = VectorL2Distance(leftVec, rightVec),
+        direction = NearestByDistance)
+      val rewritten = IndexedNearestByJoinRule(join)
+      assertSame(
+        join,
+        rewritten,
+        "right with MapType column must fall through (rule cannot materialize unsupported type)")
+    } finally {
+      spark.conf.unset(IndexedNearestByJoinRule.TempRForSqlEnabledConfKey)
+      spark.conf.unset(IndexedNearestByJoinRule.EnabledConfKey)
+    }
+  }
+
+  /**
+   * Without the temp-R conf, a non-Lance right side falls through even when the main rule is
+   * enabled. Pins the existing behavior so we don't accidentally change it when extending the
+   * rule.
+   */
+  @Test def testNonLanceRWithoutTempRConfFallsThrough(): Unit = {
+    spark.conf.set(IndexedNearestByJoinRule.EnabledConfKey, "true")
+    spark.conf.unset(IndexedNearestByJoinRule.TempRForSqlEnabledConfKey)
+    try {
+      val left = trivialPlan("lid", "lvec")
+      val parquetRight = parquetLikePlan(idCol = "rid", vecCol = "rvec")
+      val leftVec = left.output.find(_.name == "lvec").get
+      val rightVec = parquetRight.output.find(_.name == "rvec").get
+      val join = NearestByJoin(
+        left,
+        parquetRight,
+        Inner,
+        approx = true,
+        numResults = 5,
+        rankingExpression = VectorL2Distance(leftVec, rightVec),
+        direction = NearestByDistance)
+      val rewritten = IndexedNearestByJoinRule(join)
+      assertSame(
+        join,
+        rewritten,
+        "tempR conf off → non-Lance right must fall through to brute-force")
+    } finally {
+      spark.conf.unset(IndexedNearestByJoinRule.EnabledConfKey)
+    }
+  }
+
   /** Filter wrapped in SubqueryAlias still pushes — order of unwrap shouldn't matter. */
   @Test def testFilterUnderSubqueryAliasPushes(): Unit = {
     spark.conf.set(IndexedNearestByJoinRule.EnabledConfKey, "true")
@@ -389,6 +527,47 @@ class IndexedNearestByJoinRuleTest {
       StructField(vecCol, ArrayType(FloatType, containsNull = false), nullable = false)))
     val rows = (0 until 4).map(i => RowFactory.create(Integer.valueOf(i), Array.fill(8)(0.0f)))
     spark.createDataFrame(rows.asJava, schema).queryExecution.analyzed
+  }
+
+  /**
+   * A parquet-backed analyzed plan for testing the per-query temp-R rewrite path. Materialization
+   * runs `df.write.format("lance").save(...)` against this plan, so the plan must execute
+   * (unlike `trivialPlan` which is just an analyzed `LocalRelation`). Writes a tiny parquet to
+   * tempDir on first call, returns its analyzed scan plan.
+   */
+  private def parquetLikePlan(idCol: String, vecCol: String): LogicalPlan = {
+    val schema = new StructType(Array(
+      StructField(idCol, IntegerType, nullable = false),
+      StructField(
+        vecCol,
+        ArrayType(FloatType, containsNull = false),
+        nullable = false,
+        new MetadataBuilder().putLong("arrow.fixed-size-list.size", 8L).build())))
+    val rows = (0 until 4).map(i => RowFactory.create(Integer.valueOf(i), Array.fill(8)(0.5f)))
+    val parquetPath = tempDir.resolve(s"parquet_for_rule_${System.nanoTime()}").toString
+    spark.createDataFrame(rows.asJava, schema).write.parquet(parquetPath)
+    spark.read.parquet(parquetPath).queryExecution.analyzed
+  }
+
+  /**
+   * Like parquetLikePlan but adds a MapType column, which Lance's writer can't handle. Used
+   * to verify the rule's schema check refuses-and-falls-through on unsupported types.
+   */
+  private def parquetLikePlanWithMap(idCol: String, vecCol: String): LogicalPlan = {
+    import org.apache.spark.sql.functions.{lit => sqlLit, map => mapFn}
+    val schema = new StructType(Array(
+      StructField(idCol, IntegerType, nullable = false),
+      StructField(
+        vecCol,
+        ArrayType(FloatType, containsNull = false),
+        nullable = false,
+        new MetadataBuilder().putLong("arrow.fixed-size-list.size", 8L).build())))
+    val rows = (0 until 4).map(i => RowFactory.create(Integer.valueOf(i), Array.fill(8)(0.5f)))
+    val parquetPath = tempDir.resolve(s"parquet_with_map_${System.nanoTime()}").toString
+    val withMap = spark.createDataFrame(rows.asJava, schema)
+      .withColumn("attrs", mapFn(sqlLit("k"), sqlLit("v")))
+    withMap.write.parquet(parquetPath)
+    spark.read.parquet(parquetPath).queryExecution.analyzed
   }
 
   /**
