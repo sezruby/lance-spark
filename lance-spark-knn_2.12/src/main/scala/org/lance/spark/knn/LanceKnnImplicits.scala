@@ -16,6 +16,7 @@ package org.lance.spark.knn
 import org.apache.spark.sql.DataFrame
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
+import org.lance.spark.knn.internal.LanceTempR
 
 /**
  * Idiomatic DataFrame extension for the indexed nearest-K join. The Phase 2 SQL syntax
@@ -37,11 +38,21 @@ import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Relation
  *     metric = "l2")
  * }}}
  *
- * The right DataFrame MUST be a Lance scan — `spark.read.format("lance").load(uri)`. The
- * extension extracts the underlying URI from the right-side analyzed plan; if it can't find a
- * `LanceTable` it throws `IllegalArgumentException`. This is intentional: the indexed path
- * uses Lance's Java API directly to open the dataset, so a non-Lance DataFrame cannot be
- * substituted (there's no general "any DataFrame" indexed path).
+ * The right DataFrame can be either:
+ *
+ *   - A Lance scan (`spark.read.format("lance").load(uri)`). The extension extracts the
+ *     underlying URI from the right-side analyzed plan and the existing probe pipeline runs
+ *     against it directly.
+ *   - Any other DataFrame (parquet, delta, in-memory, the result of an arbitrary upstream
+ *     plan). The extension materializes it to a temp Lance dataset first via
+ *     [[org.lance.spark.knn.internal.LanceTempR.materialize]], then runs the same probe
+ *     pipeline against the temp URI. See sezruby/lance-spark#2 for the design.
+ *
+ * For the temp-Lance path to work, the session must either be in local mode or have
+ * `spark.lance.knn.tempR.dir` set to a path every executor (and the driver) can read+write
+ * — typically a shared object store (`s3://...`, `abfss://...`, `file:///shared-mount/...`)
+ * or HDFS. Cluster runs missing this conf fail fast at materialization time with a clear
+ * error message.
  *
  * == Why an extension method, not a builder ==
  *
@@ -55,17 +66,23 @@ object LanceKnnImplicits {
   implicit class LanceKnnDataFrameOps(val df: DataFrame) extends AnyVal {
 
     /**
-     * Approximate top-K nearest-neighbor join over a Lance-backed right DataFrame. The right
-     * DataFrame must be a `spark.read.format("lance").load(uri)` (any plan that wraps a
-     * `LanceTable` — `Filter`, `SubqueryAlias`, `Project` are unwrapped). For a non-Lance
-     * right side or a derived plan that loses the URI, this method throws.
+     * Approximate top-K nearest-neighbor join. The right DataFrame can be:
      *
-     * @param right             Lance-backed right DataFrame
+     *   - A Lance scan (`spark.read.format("lance").load(uri)`) — runs against R directly.
+     *   - Any other DataFrame — materialized to a temp Lance dataset first, then the
+     *     existing probe pipeline runs against the temp URI. The temp is unique per call;
+     *     it persists for the lifetime of the returned DataFrame's evaluation. (See
+     *     `LanceTempLifecycle` for query-scoped cleanup.)
+     *
+     * @param right             right DataFrame (Lance scan or any other source)
      * @param leftVecCol        name of the vector column on `this` (left)
      * @param rightVecCol       name of the vector column on `right`
      * @param k                 number of nearest neighbors per left row
      * @param metric            distance / similarity metric: "l2" | "cosine" | "dot"
-     * @param rightProjection   columns to materialize from `right`. `None` = all columns.
+     * @param rightProjection   columns to materialize from `right`. `None` = all of R's
+     *                          non-vector columns (existing behavior on Lance R; carries
+     *                          everything into the temp on non-Lance R, which can be
+     *                          expensive for wide tables).
      * @param outerJoin         left-outer mode: emit a left row even if zero neighbors found
      * @param scoreCol          name of the appended score column (default `__score`)
      * @param overfetch         multiplier on `k` during the probe before final trim
@@ -95,7 +112,16 @@ object LanceKnnImplicits {
         ef: Option[Int] = None,
         probeParallelism: Int = 1,
         balanceFragments: Boolean = false): DataFrame = {
-      val (uri, version) = LanceKnnImplicits.extractLanceUri(right)
+      // Try the existing Lance-scan path first. Falls through to temp materialization for
+      // any non-Lance right (parquet, delta, in-memory, arbitrary subplan).
+      val (uri, version) = LanceKnnImplicits.extractLanceUri(right) match {
+        case Some(t) => t
+        case None =>
+          val tempUri = LanceKnnImplicits.materializeNonLanceR(right, rightVecCol, rightProjection)
+          (tempUri, None)
+      }
+      // After temp materialization, the dataset has columns rid + vec + caller's projection.
+      // The probe pipeline reads everything from there; no further translation needed.
       IndexedNearestJoin(
         left = df,
         rightLanceUri = uri,
@@ -120,9 +146,10 @@ object LanceKnnImplicits {
   /**
    * Walk a DataFrame's analyzed plan looking for a `LanceTable`-backed
    * `DataSourceV2Relation`. Skips through wrappers that don't change the underlying
-   * relation: `SubqueryAlias`, `View`, `Project`, `Filter`. Returns `(uri, optional version)`
-   * pulled from the relation's options. Throws `IllegalArgumentException` if no Lance scan
-   * is found.
+   * relation: `SubqueryAlias`, `View`, `Project`, `Filter`. Returns
+   * `Some((uri, optional version))` pulled from the relation's options when a Lance scan
+   * is found, or `None` otherwise — callers can fall through to temp materialization in
+   * that case rather than failing.
    *
    * Lance detection mirrors `IndexedNearestByJoinRule.isLanceTable` —
    * class-name match (`getClass.getName.contains("Lance")`) — to keep the user-facing
@@ -132,20 +159,50 @@ object LanceKnnImplicits {
    *
    * Public for tests.
    */
-  private[knn] def extractLanceUri(df: DataFrame): (String, Option[Long]) = {
-    val rel = findLanceRelation(df.queryExecution.analyzed).getOrElse {
-      throw new IllegalArgumentException(
-        "kNearestJoin requires the right DataFrame to be a Lance scan " +
-          "(spark.read.format(\"lance\").load(uri)). Plan was:\n" +
-          df.queryExecution.analyzed)
+  private[knn] def extractLanceUri(df: DataFrame): Option[(String, Option[Long])] = {
+    findLanceRelation(df.queryExecution.analyzed).flatMap { rel =>
+      val opts = rel.options
+      val uri = Option(opts.get("path")).orElse(Option(opts.get("datasetUri")))
+      uri.map { u =>
+        val version = Option(opts.get("version")).map(_.toLong)
+        (u, version)
+      }
     }
-    val opts = rel.options
-    val uri = Option(opts.get("path"))
-      .orElse(Option(opts.get("datasetUri")))
-      .getOrElse(throw new IllegalArgumentException(
-        "Lance relation found but no `path` / `datasetUri` option set; cannot extract URI"))
-    val version = Option(opts.get("version")).map(_.toLong)
-    (uri, version)
+  }
+
+  /**
+   * Materialize a non-Lance right DataFrame to a temp Lance dataset and return its URI.
+   * Caller must clean up — see `LanceTempLifecycle` for the query-scoped sweeper. The
+   * scratch directory comes from [[LanceTempR.resolveScratchDir]] which reads
+   * `spark.lance.knn.tempR.dir` and falls back to local FS only in local mode.
+   *
+   * @param right            non-Lance DataFrame to materialize
+   * @param rightVecCol      vector column name (must exist on `right`)
+   * @param rightProjection  columns to carry into the temp Lance dataset, in addition to
+   *                         the synthesised rid and the vector. `None` means "all columns
+   *                         of `right` other than the vector" — matches the existing
+   *                         Lance-R semantics where omitting `rightProjection` means
+   *                         "carry everything." For wide tables, callers should pass an
+   *                         explicit `Some(...)` to avoid copying unnecessary bytes.
+   */
+  private[knn] def materializeNonLanceR(
+      right: DataFrame,
+      rightVecCol: String,
+      rightProjection: Option[Seq[String]]): String = {
+    val spark = right.sparkSession
+    val scratchDir = LanceTempR.resolveScratchDir(spark)
+    val projection: Seq[String] = rightProjection match {
+      case Some(cols) => cols.filterNot(_ == rightVecCol)
+      case None =>
+        // Default to "carry every column of R other than the vector" — matches the
+        // semantics that omitting rightProjection on a Lance scan reads every column.
+        right.schema.fieldNames.toSeq.filterNot(_ == rightVecCol)
+    }
+    LanceTempR.materialize(
+      right,
+      vecCol = rightVecCol,
+      projection = projection,
+      scratchDir = scratchDir)
   }
 
   private def findLanceRelation(plan: LogicalPlan): Option[DataSourceV2Relation] = plan match {
