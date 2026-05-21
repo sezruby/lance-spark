@@ -228,6 +228,77 @@ class LanceTempRTest {
     assertTrue(ex.getMessage.contains(LanceTempR.RidColumnName))
   }
 
+  // -- schema validation ---------------------------------------------------------------------
+
+  /** checkSupported is None for the typical projection (rid + vec + primitives + strings). */
+  @Test def testCheckSupportedAcceptsCommonTypes(): Unit = {
+    val ok = new StructType(Array(
+      StructField("rid", LongType),
+      StructField(
+        "vec",
+        ArrayType(FloatType, containsNull = false),
+        nullable = false,
+        new MetadataBuilder().putLong("arrow.fixed-size-list.size", 8L).build()),
+      StructField("title", StringType),
+      StructField("count", IntegerType),
+      StructField("when", TimestampType),
+      StructField("flag", BooleanType),
+      StructField("payload", BinaryType)))
+    assertEquals(None, LanceTempR.checkSupported(ok))
+  }
+
+  /** MapType is not Lance-writable — checkSupported flags it with a clear message. */
+  @Test def testCheckSupportedRejectsMap(): Unit = {
+    val notOk = new StructType(Array(
+      StructField("rid", LongType),
+      StructField("attrs", MapType(StringType, StringType))))
+    val res = LanceTempR.checkSupported(notOk)
+    assertTrue(res.isDefined, "MapType must be rejected")
+    assertTrue(res.get.contains("attrs"), s"reason should name the column: ${res.get}")
+    assertTrue(res.get.toLowerCase.contains("map"), s"reason should mention Map: ${res.get}")
+  }
+
+  /** Map nested inside an Array also rejected (recursive check). */
+  @Test def testCheckSupportedRejectsArrayOfMap(): Unit = {
+    val notOk = new StructType(Array(
+      StructField("rid", LongType),
+      StructField("nested", ArrayType(MapType(StringType, IntegerType)))))
+    assertTrue(LanceTempR.checkSupported(notOk).isDefined)
+  }
+
+  /** Map nested inside a Struct also rejected. */
+  @Test def testCheckSupportedRejectsStructWithMap(): Unit = {
+    val inner = new StructType(Array(StructField("ext", MapType(StringType, StringType))))
+    val notOk = new StructType(Array(
+      StructField("rid", LongType),
+      StructField("metadata", inner)))
+    assertTrue(LanceTempR.checkSupported(notOk).isDefined)
+  }
+
+  /**
+   * materialize() throws IllegalArgumentException when projection includes an unsupported
+   * type — caller (DataFrame API path) propagates this to the user.
+   */
+  @Test def testMaterializeRejectsUnsupportedProjection(): Unit = {
+    import org.apache.spark.sql.functions.{lit, map}
+    // Construct a DataFrame with a map column.
+    val parquetUri = writeRandomParquet(2, Dim)
+    val withMap = spark.read.parquet(parquetUri)
+      .withColumn("attrs", map(lit("k1"), lit("v1")))
+
+    val ex = assertThrows(
+      classOf[IllegalArgumentException],
+      () =>
+        LanceTempR.materialize(
+          withMap,
+          vecCol = "vec",
+          projection = Seq("id", "attrs"),
+          scratchDir = scratch()))
+    assertTrue(
+      ex.getMessage.toLowerCase.contains("map") || ex.getMessage.contains("attrs"),
+      s"error should name the rejected column / type; got: ${ex.getMessage}")
+  }
+
   // -- resolveScratchDir ---------------------------------------------------------------------
 
   /** Conf key set: returned as-is. */

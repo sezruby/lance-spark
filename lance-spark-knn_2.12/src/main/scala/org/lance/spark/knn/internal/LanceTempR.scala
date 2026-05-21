@@ -15,6 +15,7 @@ package org.lance.spark.knn.internal
 
 import org.apache.spark.sql.{Column, DataFrame, SparkSession}
 import org.apache.spark.sql.functions.{col, monotonically_increasing_id}
+import org.apache.spark.sql.types._
 
 import java.nio.file.{Files, Path, Paths}
 import java.util.UUID
@@ -116,6 +117,18 @@ private[knn] object LanceTempR {
       !projection.contains(RidColumnName),
       s"projection must not include the reserved rid column name '$RidColumnName' — " +
         "the helper synthesises it. Pick a different name on `right` or rename before calling.")
+    // Reject unsupported types BEFORE triggering the write. We project before checking so
+    // we only inspect the columns actually being written (vec + caller-requested payload),
+    // not unrelated columns the user happened to leave on `right`.
+    val projectedFields: Seq[StructField] =
+      ((vecCol +: projection.filterNot(_ == vecCol)).distinct).map { name =>
+        right.schema(name)
+      }
+    findUnsupportedField(StructType(projectedFields)).foreach { reason =>
+      throw new IllegalArgumentException(
+        s"per-query temp Lance materialization rejected: $reason. " +
+          "Drop the offending column from `projection`, cast it to a supported type, or use a Lance-native right side.")
+    }
 
     val tempUri = mintTempUri(scratchDir)
     val ridCol: Column = monotonically_increasing_id().as(RidColumnName)
@@ -166,6 +179,61 @@ private[knn] object LanceTempR {
           .getOrElse(System.getProperty("java.io.tmpdir"))
         s"$localDir/lance-temp-r"
     }
+  }
+
+  /**
+   * Walk the columns the helper would write (rid + vec + caller-requested projection)
+   * and return the first column whose type Lance can't write, or `None` if everything is
+   * fine. Callers use this to decide their fallback behaviour — the SQL rule path
+   * silently returns the original `NearestByJoin` (Spark's brute-force handles it), the
+   * DataFrame API path throws `IllegalArgumentException`.
+   *
+   * Without this pre-check, an unsupported type would surface as an opaque write-time
+   * error inside `df.write.format("lance").save()` after we've already started shipping
+   * task closures — slow and confusing.
+   *
+   * @param schema the projected schema (rid + vec + payload cols) the helper would write.
+   * @return `Some(reason)` if any field is unsupported, `None` if every field is fine.
+   */
+  def checkSupported(schema: StructType): Option[String] =
+    findUnsupportedField(schema)
+
+  /**
+   * Conservative type-allowlist for what Lance can write via `df.write.format("lance")`.
+   *
+   * Allowed:
+   *   - All numeric primitives (Byte/Short/Int/Long/Float/Double/Decimal)
+   *   - Boolean, String, Binary
+   *   - Date / Timestamp / TimestampNTZ
+   *   - StructType — recursive check on each field
+   *   - ArrayType — recursive check on element type
+   *
+   * Rejected:
+   *   - MapType — Lance's columnar layout doesn't support arbitrary string-keyed maps
+   *   - CalendarIntervalType — no Arrow correspondence
+   *   - UserDefinedType — opaque blobs that Lance can't know about
+   *   - NullType — there's no element type to write
+   */
+  private def findUnsupportedField(schema: StructType): Option[String] = {
+    schema.fields.iterator.flatMap { f =>
+      findUnsupportedType(f.dataType).map(reason =>
+        s"column '${f.name}' has type ${f.dataType.sql} which is not Lance-writable: $reason")
+    }.toSeq.headOption
+  }
+
+  private def findUnsupportedType(dt: DataType): Option[String] = dt match {
+    case _: NumericType | BooleanType | StringType | BinaryType => None
+    case DateType | TimestampType => None
+    case s: StructType =>
+      // Recursive check on each field.
+      s.fields.iterator.flatMap { f =>
+        findUnsupportedType(f.dataType).map(r => s"nested field '${f.name}' of struct: $r")
+      }.toSeq.headOption
+    case a: ArrayType =>
+      findUnsupportedType(a.elementType).map(r => s"array element type unsupported: $r")
+    case _: MapType => Some("MapType is not supported by lance-spark writer")
+    case _: NullType => Some("NullType has no concrete element to write")
+    case other => Some(s"unrecognised DataType ${other.getClass.getSimpleName}")
   }
 
   /**

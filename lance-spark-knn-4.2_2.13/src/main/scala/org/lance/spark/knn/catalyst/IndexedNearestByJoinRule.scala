@@ -469,11 +469,17 @@ object IndexedNearestByJoinRule extends Rule[LogicalPlan] {
     try {
       val spark = SparkSession.active
       val rightDf = LanceKnnDatasetBridge.asDataFrame(spark, right)
-      val scratchDir = LanceTempR.resolveScratchDir(spark)
-      // Carry every right-side attribute the parent plan can reference. The probe
-      // pipeline's materialize stage projects from this set, so all of right.output
-      // must be present.
+      // Pre-check schema BEFORE triggering any work — if Lance can't write any of the
+      // projected columns, fall through (return None) so Spark's brute-force rewrite
+      // handles the query. Same "refusal not partial pushdown" pattern the prefilter
+      // translator uses.
       val projection: Seq[String] = right.output.map(_.name).filterNot(_ == rightVecCol)
+      val projectedSchema = StructType(
+        (rightVecCol +: projection).map(name => rightDf.schema(name)))
+      if (LanceTempR.checkSupported(projectedSchema).isDefined) {
+        return None
+      }
+      val scratchDir = LanceTempR.resolveScratchDir(spark)
       val tempUri = LanceTempR.materialize(
         right = rightDf,
         vecCol = rightVecCol,

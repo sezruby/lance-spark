@@ -235,6 +235,99 @@ class LanceKnnImplicitsTest {
   }
 
   /**
+   * Pin the within-query "same Lance dataset path" property: both the probe and the
+   * materialize stages of the staged plan must reference the same temp Lance URI. If
+   * the wiring ever drifts (e.g. helper produces URI A but probe pipeline gets URI B),
+   * the staged pipeline reads from the wrong dataset and produces silent wrong results.
+   * This is the structural pin that prevents that.
+   */
+  @Test def testProbeAndMaterializeShareSameTempUri(): Unit = {
+    import org.lance.spark.knn.internal.staged.{LanceMaterializeLogicalPlan, LanceProbeLogicalPlan}
+    val (leftDf, _, _) = buildLeft()
+    val (_, rightIds, rightVecs) = writeRight()
+
+    val schema = new StructType(Array(
+      StructField("rid", IntegerType, nullable = false),
+      StructField(
+        "rvec",
+        ArrayType(FloatType, containsNull = false),
+        nullable = false,
+        new MetadataBuilder().putLong("arrow.fixed-size-list.size", Dim.toLong).build())))
+    val rows = rightIds.zip(rightVecs).map { case (rid, vec) =>
+      RowFactory.create(Integer.valueOf(rid), vec)
+    }
+    val inMemoryR = spark.createDataFrame(rows.toSeq.asJava, schema)
+
+    val joined = leftDf.kNearestJoin(
+      right = inMemoryR,
+      leftVecCol = "lvec",
+      rightVecCol = "rvec",
+      k = 3,
+      metric = "l2",
+      rightProjection = Some(Seq("rid")))
+
+    // Walk the analyzed plan looking for the probe and materialize logical nodes; both
+    // must carry the same `datasetUri` in their stage configs.
+    val plan = joined.queryExecution.analyzed
+    val probeNodes = plan.collect { case p: LanceProbeLogicalPlan => p.stageConf.datasetUri }
+    val materializeNodes = plan.collect { case m: LanceMaterializeLogicalPlan =>
+      m.stageConf.datasetUri
+    }
+    assertEquals(
+      1,
+      probeNodes.size,
+      s"expected exactly one LanceProbeLogicalPlan; got: $probeNodes")
+    assertEquals(
+      1,
+      materializeNodes.size,
+      s"expected exactly one LanceMaterializeLogicalPlan; got: $materializeNodes")
+    assertEquals(
+      probeNodes.head,
+      materializeNodes.head,
+      "probe and materialize must reference the SAME temp Lance dataset URI")
+  }
+
+  /**
+   * Right side has a column type Lance can't write (MapType). The DataFrame API path
+   * is explicit — the user called `kNearestJoin` directly — so it must throw with a
+   * helpful message rather than silently fall through. (The SQL rule path in the 4.2
+   * module makes the opposite choice — it falls through to Spark's brute-force rewrite
+   * because the user wrote a generic `APPROX NEAREST` query.)
+   */
+  @Test def testKNearestJoinRejectsUnsupportedColumnType(): Unit = {
+    import org.apache.spark.sql.functions.{lit, map}
+    val (leftDf, _, _) = buildLeft()
+    val (_, rightIds, rightVecs) = writeRight()
+    val schema = new StructType(Array(
+      StructField("rid", IntegerType, nullable = false),
+      StructField(
+        "rvec",
+        ArrayType(FloatType, containsNull = false),
+        nullable = false,
+        new MetadataBuilder().putLong("arrow.fixed-size-list.size", Dim.toLong).build())))
+    val rows = rightIds.zip(rightVecs).map { case (rid, vec) =>
+      RowFactory.create(Integer.valueOf(rid), vec)
+    }
+    val withMap = spark.createDataFrame(rows.toSeq.asJava, schema)
+      .withColumn("attrs", map(lit("k"), lit("v")))
+
+    val ex = assertThrows(
+      classOf[IllegalArgumentException],
+      () =>
+        leftDf.kNearestJoin(
+          right = withMap,
+          leftVecCol = "lvec",
+          rightVecCol = "rvec",
+          k = 3,
+          metric = "l2",
+          rightProjection = Some(Seq("rid", "attrs"))))
+    val msg = ex.getMessage.toLowerCase
+    assertTrue(
+      msg.contains("attrs") || msg.contains("map"),
+      s"error should mention the offending column or type; got: ${ex.getMessage}")
+  }
+
+  /**
    * In-memory R (no underlying source — `createDataFrame(rows.asJava, schema)`). Same
    * temp-materialization path; just exercises the case where the rid synthesis and write
    * have no parquet/delta to come from.
