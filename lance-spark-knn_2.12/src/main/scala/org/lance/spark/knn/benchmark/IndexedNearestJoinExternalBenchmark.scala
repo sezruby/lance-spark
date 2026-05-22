@@ -138,6 +138,14 @@ object IndexedNearestJoinExternalBenchmark {
     val dataRootOpt = sys.env.get("BENCH_DATA_PATH").orElse(sys.env.get("BENCH_DATA"))
     val dataRoot =
       dataRootOpt.getOrElse(Files.createTempDirectory("knn-external-bench-").toString)
+    // Optional config gate: BENCH_CONFIGS=b-narrow,e (or any subset). If unset, all
+    // configs run. Useful for narrow comparisons at large scale where running the full
+    // suite would take 30+ min.
+    val activeConfigs: Set[String] = sys.env.get("BENCH_CONFIGS") match {
+      case Some(s) if s.nonEmpty =>
+        s.toLowerCase(Locale.ROOT).split(",").map(_.trim).filter(_.nonEmpty).toSet
+      case _ => Set("a", "b-narrow", "b-wide", "c-narrow", "c-wide", "e", "f")
+    }
 
     val builder = SparkSession
       .builder()
@@ -199,61 +207,47 @@ object IndexedNearestJoinExternalBenchmark {
         val rightDfParquet = spark.read.parquet(rightParquetDir)
         val rightFilePaths: Seq[String] = listParquetFiles(rightParquetDir)
 
-        // Pre-write Lance-native R once (outside the timing loop) for configs C-narrow
-        // and C-wide. Apples-to-apples reference: "what does R-already-in-Lance look
-        // like?" The kNearestJoin call against these URIs uses the existing Lance probe
-        // pipeline.
-        //
-        //   C-narrow vs B-narrow ⇒ pure temp-write overhead at narrow projection
-        //   C-wide   vs B-wide   ⇒ pure temp-write overhead at wide projection
-        //   C-narrow vs E warm   ⇒ cost of staying in parquet vs migrating to Lance
-        //
-        // We write TWO Lance datasets — one with rid+rvec only (for C-narrow), one with
-        // the full payload (for C-wide). This mirrors B-narrow/B-wide which differ only
-        // in their projection list.
-        val rightLanceUriNarrow = s"$dataRoot/${scale.name}_right_native_narrow_lnc"
-        spark.read.parquet(rightParquetDir)
-          .select("rid", "rvec")
-          .write
-          .format("lance")
-          .save(rightLanceUriNarrow)
-        val rightDfLanceNarrow = spark.read.format("lance").load(rightLanceUriNarrow)
+        // Pre-write Lance-native R once (outside the timing loop) for configs C-*.
+        // Skipped when neither C-narrow nor C-wide is active — the writes alone take
+        // ~30s at wide-medium and we don't want to pay for them when running B vs E only.
+        val needCNarrow = activeConfigs.contains("c-narrow")
+        val needCWide = activeConfigs.contains("c-wide") && scale.numPayloadCols > 0
+        val cIndexNumPartitions = math.min(256, math.max(8, scale.numR / 1024))
+        val cIndexNumSubVectors = math.min(scale.dim / 4, 16)
 
-        val rightDfLanceWide: Option[DataFrame] = if (scale.numPayloadCols > 0) {
-          val rightLanceUriWide = s"$dataRoot/${scale.name}_right_native_wide_lnc"
+        val rightDfLanceNarrow: Option[DataFrame] = if (needCNarrow) {
+          val uri = s"$dataRoot/${scale.name}_right_native_narrow_lnc"
+          spark.read.parquet(rightParquetDir)
+            .select("rid", "rvec")
+            .write
+            .format("lance")
+            .save(uri)
+          val cIndexBuildStart = System.nanoTime()
+          LanceVectorIndexBuilder.buildIvfPq(
+            datasetUri = uri,
+            vectorColumn = "rvec",
+            numPartitions = cIndexNumPartitions,
+            numSubVectors = cIndexNumSubVectors,
+            numBits = 8,
+            metric = InternalMetric.L2,
+            maxIters = 50)
+          val ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - cIndexBuildStart)
+          println(f"  C-indexed-narrow: index built in $ms%d ms")
+          Some(spark.read.format("lance").load(uri))
+        } else None
+
+        val rightDfLanceWide: Option[DataFrame] = if (needCWide) {
+          val uri = s"$dataRoot/${scale.name}_right_native_wide_lnc"
           val payloadCols = (0 until scale.numPayloadCols).map(i => s"payload_$i")
           val widePayloadCols = ("rid" +: "rvec" +: payloadCols).map(col)
           spark.read.parquet(rightParquetDir)
             .select(widePayloadCols: _*)
             .write
             .format("lance")
-            .save(rightLanceUriWide)
-          Some(spark.read.format("lance").load(rightLanceUriWide))
-        } else None
-
-        // Build IVF-PQ index on both Lance datasets for the C-indexed configs. Done
-        // ONCE outside the timing loop. Same kmeans/PQ params as E so the comparison is
-        // apples-to-apples (E config builds with the same params via indexParams below).
-        val cIndexNumPartitions = math.min(256, math.max(8, scale.numR / 1024))
-        val cIndexNumSubVectors = math.min(scale.dim / 4, 16)
-        val cIndexBuildStart = System.nanoTime()
-        LanceVectorIndexBuilder.buildIvfPq(
-          datasetUri = rightLanceUriNarrow,
-          vectorColumn = "rvec",
-          numPartitions = cIndexNumPartitions,
-          numSubVectors = cIndexNumSubVectors,
-          numBits = 8,
-          metric = InternalMetric.L2,
-          maxIters = 50)
-        val cIndexNarrowBuildMs =
-          TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - cIndexBuildStart)
-        println(f"  C-indexed-narrow: index built in $cIndexNarrowBuildMs%d ms")
-
-        val cIndexedWideBuildMsOpt: Option[Long] = rightDfLanceWide.map { _ =>
-          val widePath = s"$dataRoot/${scale.name}_right_native_wide_lnc"
+            .save(uri)
           val t0 = System.nanoTime()
           LanceVectorIndexBuilder.buildIvfPq(
-            datasetUri = widePath,
+            datasetUri = uri,
             vectorColumn = "rvec",
             numPartitions = cIndexNumPartitions,
             numSubVectors = cIndexNumSubVectors,
@@ -262,9 +256,8 @@ object IndexedNearestJoinExternalBenchmark {
             maxIters = 50)
           val ms = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0)
           println(f"  C-indexed-wide:   index built in $ms%d ms")
-          ms
-        }
-        val _ = cIndexedWideBuildMsOpt // referenced below where the wide config runs
+          Some(spark.read.format("lance").load(uri))
+        } else None
 
         // ---- Config A: crossJoin baseline (skipped at large scales / wide payload) ----
         // The brute-force baseline is O(|L| × |R|) pair evaluations regardless of payload
@@ -285,26 +278,23 @@ object IndexedNearestJoinExternalBenchmark {
         }
 
         // ---- Config B-narrow: PR #3 per-query temp Lance write, narrow projection ----
-        // Projects only `rid`. Temp-Lance writes (rid + rvec) — the vector dominates.
-        // This is the apples-to-apples version of E (which also returns just `rid`).
-        val resultBNarrow =
-          timeIt(scale.name, "B-narrow: temp-Lance + kNJ (project rid only)", repeats) { () =>
-            leftDf.kNearestJoin(
-              right = rightDfParquet,
-              leftVecCol = "lvec",
-              rightVecCol = "rvec",
-              k = K,
-              metric = "l2",
-              rightProjection = Some(Seq("rid")),
-              probeParallelism = 1)
-          }
-        results += resultBNarrow
+        if (activeConfigs.contains("b-narrow")) {
+          val resultBNarrow =
+            timeIt(scale.name, "B-narrow: temp-Lance + kNJ (project rid only)", repeats) { () =>
+              leftDf.kNearestJoin(
+                right = rightDfParquet,
+                leftVecCol = "lvec",
+                rightVecCol = "rvec",
+                k = K,
+                metric = "l2",
+                rightProjection = Some(Seq("rid")),
+                probeParallelism = 1)
+            }
+          results += resultBNarrow
+        }
 
         // ---- Config B-wide: PR #3 with WIDE projection — all payload columns -------
-        // Projects rid + every payload column. Temp-Lance writes the full row width;
-        // external-index would also have to fetchRows the full set, so this isolates
-        // "temp-write-once vs fetchRows-per-query" at the same projection width.
-        if (scale.numPayloadCols > 0) {
+        if (activeConfigs.contains("b-wide") && scale.numPayloadCols > 0) {
           val widePayload =
             "rid" +: (0 until scale.numPayloadCols).map(i => s"payload_$i")
           val resultBWide = timeIt(
@@ -324,24 +314,23 @@ object IndexedNearestJoinExternalBenchmark {
         }
 
         // ---- Config C-indexed-narrow: Lance-native R + IVF-PQ index, project rid -----
-        // R is already in Lance AND has an IVF-PQ index built. Apples-to-apples vs E
-        // warm — both use IVF-PQ, both pay an index build, both refine. Difference is
-        // R lives in Lance vs parquet.
-        val resultCNarrow =
-          timeIt(
-            scale.name,
-            "C-indexed-narrow: Lance-native R (indexed) + kNJ (project rid)",
-            repeats) { () =>
-            leftDf.kNearestJoin(
-              right = rightDfLanceNarrow,
-              leftVecCol = "lvec",
-              rightVecCol = "rvec",
-              k = K,
-              metric = "l2",
-              rightProjection = Some(Seq("rid")),
-              probeParallelism = 1)
-          }
-        results += resultCNarrow
+        rightDfLanceNarrow.foreach { lanceNarrowDf =>
+          val resultCNarrow =
+            timeIt(
+              scale.name,
+              "C-indexed-narrow: Lance-native R (indexed) + kNJ (project rid)",
+              repeats) { () =>
+              leftDf.kNearestJoin(
+                right = lanceNarrowDf,
+                leftVecCol = "lvec",
+                rightVecCol = "rvec",
+                k = K,
+                metric = "l2",
+                rightProjection = Some(Seq("rid")),
+                probeParallelism = 1)
+            }
+          results += resultCNarrow
+        }
 
         // ---- Config C-indexed-wide: Lance-native R + IVF-PQ index, project rid + payload
         rightDfLanceWide.foreach { lanceWideDf =>
@@ -363,42 +352,39 @@ object IndexedNearestJoinExternalBenchmark {
         }
 
         // ---- Config E: external Lance index over parquet ----------------------------
-        // First call also builds the index — we report build cost separately as a
-        // first-run timing. Subsequent calls hit the lifecycle cache and skip the build.
-        val params = ExternalIvfPqIndexParams.builder()
-          .numPartitions(math.min(256, math.max(8, scale.numR / 1024)))
-          .numSubVectors(math.min(scale.dim / 4, 16))
-          .numBitsPerSubVector(8)
-          .metric(ExternalIvfPqIndexParams.Metric.L2)
-          .build()
-        val resultE =
-          timeWithBuild(scale.name, "E: external Lance index + kNearestJoinExternal", repeats) {
-            () =>
-              IndexedNearestJoinExternal(
-                left = leftDf,
-                rightFilePaths = rightFilePaths,
-                leftVecCol = "lvec",
-                rightVecCol = "rvec",
-                k = K,
-                metric = "l2",
-                rightProjection = Some(Seq("rid")),
-                indexParams = Some(params))
-          }
-        results += resultE
+        // ---- Config E: external Lance index over parquet ----------------------------
+        if (activeConfigs.contains("e")) {
+          val params = ExternalIvfPqIndexParams.builder()
+            .numPartitions(math.min(256, math.max(8, scale.numR / 1024)))
+            .numSubVectors(math.min(scale.dim / 4, 16))
+            .numBitsPerSubVector(8)
+            .metric(ExternalIvfPqIndexParams.Metric.L2)
+            .build()
+          val resultE =
+            timeWithBuild(scale.name, "E: external Lance index + kNearestJoinExternal", repeats) {
+              () =>
+                IndexedNearestJoinExternal(
+                  left = leftDf,
+                  rightFilePaths = rightFilePaths,
+                  leftVecCol = "lvec",
+                  rightVecCol = "rvec",
+                  k = K,
+                  metric = "l2",
+                  rightProjection = Some(Seq("rid")),
+                  indexParams = Some(params))
+            }
+          results += resultE
+        }
 
         // ---- Config F: Spark MLlib BucketedRandomProjectionLSH (L2) -----------------
-        // The realistic non-Lance baseline a Spark user reaches for. LSH builds a model
-        // over R, then `approxSimilarityJoin(L, R, threshold)` returns pairs whose
-        // hashed buckets collide. We post-filter to top-K per L-row, mirroring the
-        // shape of B/E. Skip if BENCH_SKIP_LSH=true (e.g. for fast iteration).
         val skipLsh = sys.env.get("BENCH_SKIP_LSH").exists(_.equalsIgnoreCase("true"))
-        if (!skipLsh) {
+        if (activeConfigs.contains("f") && !skipLsh) {
           val resultF =
             timeWithBuild(scale.name, "F: MLlib BucketedRandomProjectionLSH + topK", repeats) {
               () => lshKnnJoin(spark, leftDf, rightDfParquet, scale.dim, K)
             }
           results += resultF
-        } else {
+        } else if (activeConfigs.contains("f")) {
           println(s"  F: MLlib LSH ... skipped (BENCH_SKIP_LSH=true)")
         }
 

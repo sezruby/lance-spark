@@ -188,6 +188,7 @@ object IndexedNearestJoinExternal {
     // stage existed. Today it controls the fused stage's parallelism.
     val targetRowsPerTask = TargetRowsPerTask
     val defaultPar = spark.sparkContext.defaultParallelism.max(1)
+    val shufflePar = spark.conf.get("spark.sql.shuffle.partitions").toInt.max(defaultPar)
     val estimatedRows: Long = {
       val stats = left.queryExecution.optimizedPlan.stats
       // stats.rowCount is Optional in Spark ≥3.0; check via java.util.Optional API.
@@ -197,11 +198,14 @@ object IndexedNearestJoinExternal {
     val sizedParallelism: Int =
       if (estimatedRows > 0) {
         val want = ((estimatedRows + targetRowsPerTask - 1) / targetRowsPerTask).toInt
-        math.max(1, math.min(want, defaultPar))
+        // Cap at shufflePar (= max(spark.sql.shuffle.partitions, defaultParallelism)).
+        // This is what Spark uses for shuffle parallelism by convention; capping there
+        // gives tasks finer-grained scheduling than capping at defaultParallelism, which
+        // matters when |L| is large (1M+ queries) and the cluster has substantial cores.
+        math.max(1, math.min(want, shufflePar))
       } else {
-        // No stats available — fall back to defaultParallelism. This is the same
-        // shape `spark.sql.shuffle.partitions` would give but tied to actual cores.
-        defaultPar
+        // No stats available — fall back to shufflePar.
+        shufflePar
       }
     val parallelism = mergeParallelism.getOrElse(sizedParallelism)
     val leftPreRdd: RDD[Row] = left.rdd
@@ -211,6 +215,7 @@ object IndexedNearestJoinExternal {
       s"[IndexedNearestJoinExternal] left.partitions = $currentParts, " +
         s"left.estimatedRows = $estimatedRows, " +
         s"defaultParallelism = $defaultPar, " +
+        s"shuffle.partitions = $shufflePar, " +
         s"target parallelism = $parallelism")
     // scalastyle:on println
     val leftRdd: RDD[Row] =
