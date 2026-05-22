@@ -88,6 +88,9 @@ object ExternalFusedStage {
     extends Serializable
 
   def run(left: RDD[Row], conf: Conf): RDD[Row] = {
+    // scalastyle:off println
+    println(s"[ExternalFusedStage] running on ${left.getNumPartitions} task(s)")
+    // scalastyle:on println
     left.mapPartitions(iter => fusedPartition(iter, conf))
   }
 

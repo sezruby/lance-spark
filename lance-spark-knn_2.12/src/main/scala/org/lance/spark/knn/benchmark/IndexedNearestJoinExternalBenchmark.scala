@@ -104,6 +104,10 @@ object IndexedNearestJoinExternalBenchmark {
     Scale("wide-large", numR = 1000000, numL = 100, dim = 128, numPayloadCols = 64),
     // Long-run target — slowest config aimed at ~2-3 min so the gap is unambiguous
     // even under cluster noise. 10M rows × 16 cols ≈ 15 GB total R; 1000 queries.
+    // CAUTION: requires substantial scratch volume (≥30 GB free across temp Lance +
+    // native Lance narrow + native Lance wide + external index). Cluster runs have
+    // hit "Disk quota exceeded" on shared 100 GB volumes. Opt in only when scratch
+    // capacity is verified. Default scales below skip this.
     Scale("mega-medium", numR = 10000000, numL = 1000, dim = 128, numPayloadCols = 16))
     .map(s => s.name -> s)
     .toMap
@@ -155,6 +159,17 @@ object IndexedNearestJoinExternalBenchmark {
     if (clusterMode) {
       spark.conf.set("spark.lance.knn.tempR.dir", s"$dataRoot/temp-r-scratch")
       spark.conf.set("spark.lance.knn.externalIndex.dir", s"$dataRoot/external-idx-scratch")
+    }
+
+    // Cluster scratch volumes have limited quotas and the in-process LanceTempLifecycle
+    // cleanup only fires for the CURRENT run. Old runs from prior submissions leave
+    // multi-GB scratch dirs behind, eventually triggering "Disk quota exceeded" at
+    // write time. Sweep sibling `knn-bench-data-*` directories before this run starts
+    // to keep the volume clean. Only sweep when (a) clusterMode and (b) dataRoot
+    // matches the cpd-submit-bench naming pattern (so we never accidentally delete
+    // something else).
+    if (clusterMode) {
+      cleanupSiblingScratchDirs(dataRoot)
     }
 
     println("=" * 96)
@@ -449,6 +464,66 @@ object IndexedNearestJoinExternalBenchmark {
       .write
       .mode("overwrite")
       .parquet(uri)
+  }
+
+  /**
+   * Sweep stale sibling `knn-bench-data-*` directories from `dataRoot`'s parent dir
+   * before this run starts. Defends against the "Disk quota exceeded" failure mode
+   * on cluster scratch volumes when prior bench runs left their scratch behind.
+   *
+   * Strict matching: only deletes siblings whose name starts with `knn-bench-data-`
+   * (the cpd-submit-bench.sh naming pattern). Skips this run's own dataRoot. If the
+   * parent dir doesn't exist or this run's path doesn't fit the pattern, no-op.
+   */
+  private def cleanupSiblingScratchDirs(dataRoot: String): Unit = {
+    val localPath = if (dataRoot.startsWith("file://")) dataRoot.stripPrefix("file://") else dataRoot
+    val rootPath = Paths.get(localPath)
+    val name = Option(rootPath.getFileName).map(_.toString).getOrElse("")
+    if (!name.startsWith("knn-bench-data-")) {
+      println(
+        s"[cleanup] dataRoot $dataRoot doesn't match knn-bench-data-* pattern; " +
+          "skipping sibling sweep")
+      return
+    }
+    val parent = rootPath.getParent
+    if (parent == null || !Files.exists(parent)) {
+      return
+    }
+    val it = Files.list(parent)
+    try {
+      val deleted = scala.collection.mutable.ArrayBuffer.empty[String]
+      val errors = scala.collection.mutable.ArrayBuffer.empty[String]
+      it.iterator().asScala.foreach { p =>
+        val pname = Option(p.getFileName).map(_.toString).getOrElse("")
+        if (pname.startsWith("knn-bench-data-") && p != rootPath) {
+          try {
+            // Recursive delete via Files.walk + reverse order.
+            val walk = Files.walk(p)
+            try {
+              walk
+                .iterator()
+                .asScala
+                .toSeq
+                .reverse
+                .foreach { q =>
+                  try Files.deleteIfExists(q)
+                  catch { case _: Throwable => /* best effort */ }
+                }
+            } finally walk.close()
+            deleted += pname
+          } catch {
+            case e: Throwable =>
+              errors += s"$pname: ${e.getMessage}"
+          }
+        }
+      }
+      if (deleted.nonEmpty) {
+        println(s"[cleanup] swept ${deleted.size} stale scratch dirs: ${deleted.mkString(", ")}")
+      }
+      if (errors.nonEmpty) {
+        println(s"[cleanup] errors during sweep (best-effort, continuing): ${errors.mkString("; ")}")
+      }
+    } finally it.close()
   }
 
   private def listParquetFiles(dir: String): Seq[String] = {

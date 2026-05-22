@@ -151,13 +151,77 @@ object IndexedNearestJoinExternal {
       rightFields = rightProjectedFields,
       leftFieldCount = leftFieldCount,
       outerJoin = outerJoin)
-    val _ = mergeParallelism // unused after fusion; kept on the API for back-compat
 
-    val leftRdd: RDD[Row] = left.rdd
+    // Repartition `left` before the fused stage so probe + materialize both run with
+    // a configurable parallelism, independent of however the user partitioned `left`.
+    // Without this, a small `|L|` (typical for KNN — hundreds to thousands of queries)
+    // typically lands in 1-2 Spark partitions because Spark right-sizes for the row
+    // count, leaving fetchRows running serially. With this repartition,
+    // `mergeParallelism` (default = spark.sql.shuffle.partitions) tasks each probe a
+    // slice of left rows and run their own fetchRows pass against the shared index.
+    //
+    // The `mergeParallelism` parameter name is back-compat from when the merge stage
+    // existed. Today it controls the fused stage's parallelism. Renaming would break
+    // the API without functional benefit.
+    // Decide parallelism for the fused stage. The fused stage runs `left.rdd.partitions`
+    // tasks; for KNN workloads `|L|` (number of query vectors) is often small relative
+    // to cluster cores and Spark right-sizes left's partition count to row count, which
+    // can leave the fused stage running 1-2 tasks regardless of how many cores are
+    // available. We size parallelism from the source row count when the caller doesn't
+    // specify, with these rules:
+    //
+    //   1. Explicit `mergeParallelism` from caller wins (caller knows their workload).
+    //   2. Otherwise we estimate `numL` from Spark's optimizer stats. If a reliable
+    //      estimate is available (cached DataFrame or upstream stats), use
+    //      `targetTasks = ceil(numL / TargetRowsPerTask)`, capped at the cluster's
+    //      `defaultParallelism` (so we don't over-shard tiny inputs into many empty
+    //      tasks).
+    //   3. Cap from below by `left.rdd.partitions.size` — we only repartition UP, never
+    //      down. If the user already has good partitioning we leave it alone.
+    //
+    // `TargetRowsPerTask` is a heuristic. Each task processes its share serially
+    // through Lance's idx.search(); one search() takes ~5-50ms at typical scales, so
+    // ~100 rows/task gives ~0.5-5 sec per task — comfortable for Spark scheduling
+    // overhead.
+    //
+    // The `mergeParallelism` parameter name is back-compat from when an explicit merge
+    // stage existed. Today it controls the fused stage's parallelism.
+    val targetRowsPerTask = TargetRowsPerTask
+    val defaultPar = spark.sparkContext.defaultParallelism.max(1)
+    val estimatedRows: Long = {
+      val stats = left.queryExecution.optimizedPlan.stats
+      // stats.rowCount is Optional in Spark ≥3.0; check via java.util.Optional API.
+      val r = stats.rowCount
+      if (r.isDefined) r.get.toLong else -1L
+    }
+    val sizedParallelism: Int =
+      if (estimatedRows > 0) {
+        val want = ((estimatedRows + targetRowsPerTask - 1) / targetRowsPerTask).toInt
+        math.max(1, math.min(want, defaultPar))
+      } else {
+        // No stats available — fall back to defaultParallelism. This is the same
+        // shape `spark.sql.shuffle.partitions` would give but tied to actual cores.
+        defaultPar
+      }
+    val parallelism = mergeParallelism.getOrElse(sizedParallelism)
+    val leftPreRdd: RDD[Row] = left.rdd
+    val currentParts = leftPreRdd.getNumPartitions
+    // scalastyle:off println
+    println(
+      s"[IndexedNearestJoinExternal] left.partitions = $currentParts, " +
+        s"left.estimatedRows = $estimatedRows, " +
+        s"defaultParallelism = $defaultPar, " +
+        s"target parallelism = $parallelism")
+    // scalastyle:on println
+    val leftRdd: RDD[Row] =
+      if (currentParts < parallelism) leftPreRdd.repartition(parallelism) else leftPreRdd
     val joinedRows: RDD[Row] = ExternalFusedStage.run(leftRdd, fusedConf)
 
     spark.createDataFrame(joinedRows, outputSchema)
   }
+
+  /** Heuristic target rows per fused-stage task. See `apply`'s parallelism comment. */
+  private val TargetRowsPerTask: Long = 100L
 
   private def buildOutputSchema(
       left: StructType,
