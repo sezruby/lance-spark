@@ -462,7 +462,8 @@ object IndexedNearestJoinExternalBenchmark {
    * parent dir doesn't exist or this run's path doesn't fit the pattern, no-op.
    */
   private def cleanupSiblingScratchDirs(dataRoot: String): Unit = {
-    val localPath = if (dataRoot.startsWith("file://")) dataRoot.stripPrefix("file://") else dataRoot
+    val localPath =
+      if (dataRoot.startsWith("file://")) dataRoot.stripPrefix("file://") else dataRoot
     val rootPath = Paths.get(localPath)
     val name = Option(rootPath.getFileName).map(_.toString).getOrElse("")
     if (!name.startsWith("knn-bench-data-")) {
@@ -507,7 +508,8 @@ object IndexedNearestJoinExternalBenchmark {
         println(s"[cleanup] swept ${deleted.size} stale scratch dirs: ${deleted.mkString(", ")}")
       }
       if (errors.nonEmpty) {
-        println(s"[cleanup] errors during sweep (best-effort, continuing): ${errors.mkString("; ")}")
+        println(
+          s"[cleanup] errors during sweep (best-effort, continuing): ${errors.mkString("; ")}")
       }
     } finally it.close()
   }
@@ -706,7 +708,10 @@ object IndexedNearestJoinExternalBenchmark {
       val baselineB = rs.find(_.config.startsWith("B-narrow:")).map(_.totalMs)
         .orElse(rs.find(_.config.startsWith("B:")).map(_.totalMs))
         .getOrElse(0L)
-      val _ = rs.find(_.config.startsWith("C-indexed-narrow:")).map(_.totalMs) // C reference; printed in row
+      val _ =
+        rs.find(_.config.startsWith("C-indexed-narrow:")).map(
+          _.totalMs
+        ) // C reference; printed in row
       rs.foreach { r =>
         val buildStr = r.indexBuildMs.map(_.toString).getOrElse("—")
         val vsA =

@@ -148,13 +148,21 @@ object ExternalFusedStage {
           val (start, end) = flatRanges(liIdx)
           if (refs.isEmpty && conf.outerJoin) {
             out += assembleRow(
-              leftRow, conf.leftFieldCount, conf.rightFields, rightValues = null, score = null)
+              leftRow,
+              conf.leftFieldCount,
+              conf.rightFields,
+              rightValues = null,
+              score = null)
           } else if (refs.nonEmpty) {
             var i = 0
             while (i < refs.length) {
               val rightMap = if (start + i < materialized.size) materialized(start + i) else null
               out += assembleRow(
-                leftRow, conf.leftFieldCount, conf.rightFields, rightMap, refs(i).score)
+                leftRow,
+                conf.leftFieldCount,
+                conf.rightFields,
+                rightMap,
+                refs(i).score)
               i += 1
             }
           }

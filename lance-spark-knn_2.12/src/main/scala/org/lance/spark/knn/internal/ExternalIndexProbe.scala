@@ -13,11 +13,10 @@
  */
 package org.lance.spark.knn.internal
 
-import org.apache.spark.sql.Row
-import org.lance.index.external.{ExternalIvfPqIndex, ExternalIvfPqIndexParams, ParquetRowKey, SearchResult}
-
 import org.apache.arrow.memory.RootAllocator
 import org.apache.arrow.vector.ipc.ArrowStreamReader
+import org.apache.spark.sql.Row
+import org.lance.index.external.{ExternalIvfPqIndex, ExternalIvfPqIndexParams, ParquetRowKey, SearchResult}
 
 import java.io.ByteArrayInputStream
 
@@ -133,7 +132,7 @@ final class ExternalIndexProbe(indexUri: String) extends AutoCloseable {
  * file identity instead of an opaque Lance `_rowid`.
  */
 final case class ScoredFileRowRef(filePath: String, rowIndex: Long, score: Float)
-    extends Serializable
+  extends Serializable
 
 object ExternalIndexProbe {
 
