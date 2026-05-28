@@ -191,6 +191,16 @@ object IndexedNearestJoinExternalBenchmark {
     println(f"Scales:         ${scales.map(_.name).mkString(", ")}")
     println()
 
+    // Cluster health gate: probe every task slot with a fixed-cost CPU loop and print
+    // per-executor timings. Outliers indicate noisy neighbors / pinned cores / thermal
+    // throttling and make config-vs-config medians unreliable. With
+    // BENCH_CPU_CHECK_FAIL_RATIO set, refuses to proceed when max/median exceeds the
+    // ratio. With BENCH_CPU_CHECK_SKIP=true, skips entirely.
+    if (!sys.env.get("BENCH_CPU_CHECK_SKIP").exists(_.equalsIgnoreCase("true"))) {
+      val failRatio = sys.env.get("BENCH_CPU_CHECK_FAIL_RATIO").map(_.toDouble)
+      ExecutorCpuCheck.run(spark, failRatio)
+    }
+
     val results = scala.collection.mutable.ArrayBuffer.empty[Result]
     try {
       scales.foreach { scale =>

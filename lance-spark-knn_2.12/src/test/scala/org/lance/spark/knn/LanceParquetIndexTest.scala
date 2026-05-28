@@ -87,7 +87,8 @@ class LanceParquetIndexTest {
         assertTrue(
           sortedFilePaths.contains(h.getFilePath),
           s"result filePath ${h.getFilePath} not in registered set $sortedFilePaths")
-        assertTrue(h.getRowIndex >= 0 && h.getRowIndex < NumRowsPerFile,
+        assertTrue(
+          h.getRowIndex >= 0 && h.getRowIndex < NumRowsPerFile,
           s"rowIndex ${h.getRowIndex} out of range [0, $NumRowsPerFile)")
       }
       val scores = hits.map(_.getDistance)
