@@ -169,8 +169,22 @@
                                             <exclude>org.apache.spark:*</exclude>
                                             <!-- Scala stdlib is provided by the cluster -->
                                             <exclude>org.scala-lang:*</exclude>
-                                            <!-- Netty is provided by Spark -->
-                                            <exclude>io.netty:*</exclude>
+                                            <!--
+                                              Netty intentionally bundled. With
+                                              spark.{driver,executor}.userClassPathFirst=true,
+                                              relying on Spark's own Netty produces a
+                                              cross-classloader IllegalAccessError on
+                                              UnsafeDirectLittleEndian (Spark loads its Netty
+                                              on the AppClassLoader, the user jar's child
+                                              loader sees a different one). Bundling Netty in
+                                              the user jar produces a self-contained classpath
+                                              that doesn't depend on whether the cluster
+                                              honors userClassPathFirst. Without that flag,
+                                              the cluster's Netty wins via AppClassLoader and
+                                              ours sits unreferenced — net cost is ~3 MB of
+                                              fat-jar bloat for a config that works in both
+                                              modes.
+                                            -->
                                         </excludes>
                                     </artifactSet>
                                     <transformers>

@@ -108,7 +108,18 @@ object IndexedNearestJoinExternalBenchmark {
     // native Lance narrow + native Lance wide + external index). Cluster runs have
     // hit "Disk quota exceeded" on shared 100 GB volumes. Opt in only when scratch
     // capacity is verified. Default scales below skip this.
-    Scale("mega-medium", numR = 10000000, numL = 1000, dim = 128, numPayloadCols = 16))
+    Scale("mega-medium", numR = 10000000, numL = 1000, dim = 128, numPayloadCols = 16),
+    // Stresses Path A's distributed merge: |R|=25M produces ~25 Lance fragments after
+    // default fragment sizing, and |L|=10000 makes per-task probe work substantial.
+    // This is the regime where C-indexed's multi-stage shape (probe per fragment →
+    // shuffle by leftId → reduceByKey merge across fragments → materialize) starts
+    // beating the single-stage E shape, because each Spark task does less per-query
+    // work and the cross-fragment merge happens in parallel rather than serialized
+    // inside one Lance idx.search() call. Disk: ~50 GB total scratch (B temp ~12 GB,
+    // C-indexed Lance ~12 GB + ~500 MB index, E index ~125 MB, parquet ~37 GB). Fits
+    // in 100 GB cluster scratch with margin. Run via
+    // BENCH_CONFIGS=b-narrow,c-narrow,c-distributed-narrow,e to compare.
+    Scale("huge-medium", numR = 25000000, numL = 10000, dim = 128, numPayloadCols = 16))
     .map(s => s.name -> s)
     .toMap
 
@@ -144,7 +155,8 @@ object IndexedNearestJoinExternalBenchmark {
     val activeConfigs: Set[String] = sys.env.get("BENCH_CONFIGS") match {
       case Some(s) if s.nonEmpty =>
         s.toLowerCase(Locale.ROOT).split(",").map(_.trim).filter(_.nonEmpty).toSet
-      case _ => Set("a", "b-narrow", "b-wide", "c-narrow", "c-wide", "e", "f")
+      case _ =>
+        Set("a", "b-narrow", "b-wide", "c-narrow", "c-distributed-narrow", "c-wide", "e", "f")
     }
 
     val builder = SparkSession
@@ -158,6 +170,12 @@ object IndexedNearestJoinExternalBenchmark {
         .config("spark.driver.host", "127.0.0.1")
         .config("spark.sql.shuffle.partitions", "16")
     }
+    // Detect whether we joined an existing SparkSession (e.g. running as a
+    // Databricks JAR task inside a shared REPL session, or under spark-shell).
+    // If so, do NOT call spark.stop() at the end — that would kill the host
+    // session and the bench's own final summary print would land in stderr
+    // after the REPL is already torn down. Only stop the session we created.
+    val sparkAlreadyRunning = SparkSession.getActiveSession.isDefined
     val spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
 
@@ -208,25 +226,30 @@ object IndexedNearestJoinExternalBenchmark {
         println(s"Scale: $scale")
         println("-" * 96)
 
-        // Build left in memory, right as a single-file parquet on disk. The external-index
-        // path takes explicit file paths, so we coalesce(1) to control the file count.
+        // Build left in memory, right as parquet on disk. The external-index path takes
+        // explicit file paths and supports multiple files; we partition R so each parquet
+        // file is ~1M rows, which keeps the parquet write parallel rather than coalescing
+        // 70+ GB through a single executor.
         val leftDf = buildLeft(spark, scale).cache()
         leftDf.count()
         val rightParquetDir = s"$dataRoot/${scale.name}_right_parquet_dir"
-        writeRightParquet(spark, scale, rightParquetDir, parts = 1)
+        val rightParts = math.max(1, scale.numR / 1000000)
+        writeRightParquet(spark, scale, rightParquetDir, parts = rightParts)
         val rightDfParquet = spark.read.parquet(rightParquetDir)
         val rightFilePaths: Seq[String] = listParquetFiles(rightParquetDir)
 
         // Pre-write Lance-native R once (outside the timing loop) for configs C-*.
         // Skipped when neither C-narrow nor C-wide is active — the writes alone take
         // ~30s at wide-medium and we don't want to pay for them when running B vs E only.
-        val needCNarrow = activeConfigs.contains("c-narrow")
+        val needCNarrow =
+          activeConfigs.contains("c-narrow") || activeConfigs.contains("c-distributed-narrow")
         val needCWide = activeConfigs.contains("c-wide") && scale.numPayloadCols > 0
         val cIndexNumPartitions = math.min(256, math.max(8, scale.numR / 1024))
         val cIndexNumSubVectors = math.min(scale.dim / 4, 16)
 
         val rightDfLanceNarrow: Option[DataFrame] = if (needCNarrow) {
           val uri = s"$dataRoot/${scale.name}_right_native_narrow_lnc"
+          deletePathIfExists(spark, uri)
           spark.read.parquet(rightParquetDir)
             .select("rid", "rvec")
             .write
@@ -250,6 +273,7 @@ object IndexedNearestJoinExternalBenchmark {
           val uri = s"$dataRoot/${scale.name}_right_native_wide_lnc"
           val payloadCols = (0 until scale.numPayloadCols).map(i => s"payload_$i")
           val widePayloadCols = ("rid" +: "rvec" +: payloadCols).map(col)
+          deletePathIfExists(spark, uri)
           spark.read.parquet(rightParquetDir)
             .select(widePayloadCols: _*)
             .write
@@ -342,6 +366,36 @@ object IndexedNearestJoinExternalBenchmark {
           results += resultCNarrow
         }
 
+        // ---- Config C-distributed-narrow: Lance-native R + IVF-PQ index, distributed merge ---
+        // Same as C-indexed-narrow but probeParallelism > 1 so each query's IVF probe is
+        // split across multiple Spark tasks (one per Lance fragment group). The shuffle
+        // exchange and per-fragment top-K merge that the staged pipeline does become
+        // load-bearing rather than vestigial. Expected to win at large |R| × |L| where
+        // serial per-query probe inside one Lance call becomes the bottleneck.
+        if (activeConfigs.contains("c-distributed-narrow")) {
+          rightDfLanceNarrow.foreach { lanceNarrowDf =>
+            // probeParallelism is bounded by the number of Lance fragments. Lance's
+            // default fragment sizing is ~1M rows per fragment, so |R|=50M ≈ 50 frags.
+            // We pick a target proportional to |R| and let Lance clamp.
+            val targetProbeP = math.min(64, math.max(2, scale.numR / 1000000))
+            val resultCDistNarrow =
+              timeIt(
+                scale.name,
+                f"C-distributed-narrow: Lance-native R (indexed, probeParallelism=$targetProbeP) + kNJ",
+                repeats) { () =>
+                leftDf.kNearestJoin(
+                  right = lanceNarrowDf,
+                  leftVecCol = "lvec",
+                  rightVecCol = "rvec",
+                  k = K,
+                  metric = "l2",
+                  rightProjection = Some(Seq("rid")),
+                  probeParallelism = targetProbeP)
+              }
+            results += resultCDistNarrow
+          }
+        }
+
         // ---- Config C-indexed-wide: Lance-native R + IVF-PQ index, project rid + payload
         rightDfLanceWide.foreach { lanceWideDf =>
           val widePayload = "rid" +: (0 until scale.numPayloadCols).map(i => s"payload_$i")
@@ -410,7 +464,12 @@ object IndexedNearestJoinExternalBenchmark {
       println("=" * 96)
       printSummary(results.toSeq)
     } finally {
-      spark.stop()
+      // Only stop the session if we created it. When running as a Databricks
+      // JAR task (or any other harness that pre-creates the SparkSession),
+      // calling stop() tears down the host and truncates trailing output.
+      if (!sparkAlreadyRunning) {
+        spark.stop()
+      }
     }
   }
 
@@ -472,6 +531,13 @@ object IndexedNearestJoinExternalBenchmark {
    * parent dir doesn't exist or this run's path doesn't fit the pattern, no-op.
    */
   private def cleanupSiblingScratchDirs(dataRoot: String): Unit = {
+    // Cloud-scheme dataRoots (abfss://, s3://, ...) are out of scope for the sweep —
+    // it's a local-fs convenience, not a cloud-bucket cleaner. Manage cloud scratch
+    // by lifecycle policy / blob TTL on the storage side.
+    if (dataRoot.contains("://") && !dataRoot.startsWith("file://")) {
+      println(s"[cleanup] dataRoot $dataRoot is a cloud URI; skipping sibling sweep")
+      return
+    }
     val localPath =
       if (dataRoot.startsWith("file://")) dataRoot.stripPrefix("file://") else dataRoot
     val rootPath = Paths.get(localPath)
@@ -524,21 +590,53 @@ object IndexedNearestJoinExternalBenchmark {
     } finally it.close()
   }
 
-  private def listParquetFiles(dir: String): Seq[String] = {
-    // Strip the "file://" scheme so java.nio.file.Paths can read the directory.
-    // For non-file schemes (s3://, abfss://, hdfs://) this would need a Hadoop FileSystem
-    // listing — but the external-index API takes plain file paths anyway, and the cluster
-    // runs use `file:///valve-binaries/...` (a shared mount). If we ever support cloud
-    // sources directly, switch to `org.apache.hadoop.fs.FileSystem.get(uri).listStatus`.
-    val localDir = if (dir.startsWith("file://")) dir.stripPrefix("file://") else dir
-    val p = Paths.get(localDir)
-    val it = Files.list(p)
+  /**
+   * Delete `path` if it exists. Used before Lance writes so re-running the bench
+   * against the same scratch dir (a) doesn't trip
+   * `org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException` on Lance
+   * dataset paths (the lance datasource doesn't auto-overwrite even when
+   * `mode("overwrite")` is set), and (b) doesn't leave half-written Lance fragments
+   * around. Skips silently if the path doesn't exist or the delete fails — the
+   * subsequent write will surface a clearer error if the path is genuinely
+   * unwritable.
+   */
+  private def deletePathIfExists(spark: org.apache.spark.sql.SparkSession, uri: String): Unit = {
     try {
-      it.iterator().asScala.toSeq
-        .filter(f => f.toString.endsWith(".parquet"))
-        .map(_.toString)
+      val hadoopPath = new org.apache.hadoop.fs.Path(uri)
+      val conf = spark.sparkContext.hadoopConfiguration
+      val fs = hadoopPath.getFileSystem(conf)
+      if (fs.exists(hadoopPath)) {
+        fs.delete(hadoopPath, /* recursive = */ true)
+      }
+    } catch { case _: Throwable => /* best effort */ }
+  }
+
+  private def listParquetFiles(dir: String): Seq[String] = {
+    // For local paths use java.nio (cheaper, no Hadoop init). For non-file schemes
+    // (abfss://, s3://, etc.) use Hadoop FileSystem so the bench can scratch onto
+    // cloud storage when the local CPD volume is full or an alternate region is
+    // wanted. The external-index API takes whatever string we hand it; Lance's
+    // parquet reader resolves URIs natively (object_store-backed).
+    if (dir.startsWith("file://") || !dir.contains("://")) {
+      val localDir = if (dir.startsWith("file://")) dir.stripPrefix("file://") else dir
+      val p = Paths.get(localDir)
+      val it = Files.list(p)
+      try {
+        it.iterator().asScala.toSeq
+          .filter(f => f.toString.endsWith(".parquet"))
+          .map(_.toString)
+          .sorted
+      } finally it.close()
+    } else {
+      val hadoopPath = new org.apache.hadoop.fs.Path(dir)
+      val conf = org.apache.spark.sql.SparkSession.active.sparkContext.hadoopConfiguration
+      val fs = hadoopPath.getFileSystem(conf)
+      fs.listStatus(hadoopPath).iterator
+        .filter(s => s.getPath.getName.endsWith(".parquet"))
+        .map(_.getPath.toString)
+        .toSeq
         .sorted
-    } finally it.close()
+    }
   }
 
   private def leftSchema(dim: Int): StructType = new StructType(
