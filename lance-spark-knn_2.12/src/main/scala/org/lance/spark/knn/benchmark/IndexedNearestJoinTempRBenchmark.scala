@@ -141,6 +141,15 @@ object IndexedNearestJoinTempRBenchmark {
     val spark = builder.getOrCreate()
     spark.sparkContext.setLogLevel("WARN")
 
+    // Config D (kNearestJoin against parquet R) hits the public API which calls
+    // LanceTempR.resolveScratchDir → spark.lance.knn.tempR.dir. In cluster mode
+    // that conf must point at a shared path; reuse the bench's BENCH_DATA_PATH so
+    // a single env var configures both. In local mode let the helper fall back to
+    // spark.local.dir on its own.
+    if (clusterMode) {
+      spark.conf.set("spark.lance.knn.tempR.dir", s"$dataRoot/temp-r-scratch")
+    }
+
     println("=" * 76)
     println("Per-query temp Lance benchmark — non-Lance R via temp write")
     println("=" * 76)
