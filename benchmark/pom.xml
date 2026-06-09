@@ -14,6 +14,9 @@
         <spark.compat.version>3.5</spark.compat.version>
         <scala.compat.version>2.12</scala.compat.version>
         <kyuubi.version>1.11.0</kyuubi.version>
+        <lance.version>6.0.0-beta.4</lance.version>
+        <lance-spark.version>0.4.0-beta.4</lance-spark.version>
+        <arrow.version>15.0.2</arrow.version>
         <java.release>11</java.release>
         <maven.compiler.release>${java.release}</maven.compiler.release>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
@@ -32,6 +35,33 @@
             <groupId>org.apache.kyuubi</groupId>
             <artifactId>kyuubi-spark-connector-tpcds_${scala.compat.version}</artifactId>
             <version>${kyuubi.version}</version>
+        </dependency>
+        <!-- MergeStrategyBenchmark: SQL MERGE INTO (via lance-spark) vs.
+             direct lance-core MergeInsertParams. -->
+        <dependency>
+            <groupId>org.lance</groupId>
+            <artifactId>lance-spark-3.5_${scala.compat.version}</artifactId>
+            <version>${lance-spark.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.lance</groupId>
+            <artifactId>lance-core</artifactId>
+            <version>${lance.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-c-data</artifactId>
+            <version>${arrow.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-vector</artifactId>
+            <version>${arrow.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.arrow</groupId>
+            <artifactId>arrow-memory-netty</artifactId>
+            <version>${arrow.version}</version>
         </dependency>
     </dependencies>
 
