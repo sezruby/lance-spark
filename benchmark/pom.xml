@@ -14,6 +14,8 @@
         <spark.compat.version>3.5</spark.compat.version>
         <scala.compat.version>2.12</scala.compat.version>
         <kyuubi.version>1.11.0</kyuubi.version>
+        <!-- Plain upstream lance-core + lance-spark (same versions used in
+             the local M5 Max benchmark). -->
         <lance.version>6.0.0-beta.4</lance.version>
         <lance-spark.version>0.4.0-beta.4</lance-spark.version>
         <arrow.version>15.0.2</arrow.version>
@@ -37,7 +39,11 @@
             <version>${kyuubi.version}</version>
         </dependency>
         <!-- MergeStrategyBenchmark: SQL MERGE INTO (via lance-spark) vs.
-             direct lance-core MergeInsertParams. -->
+             direct lance-core MergeInsertParams.
+             Provided-scope at runtime: the cluster classpath supplies
+             lance-spark-bundle-...-psdk.jni-classloader.1.jar via
+             spark.{driver,executor}.extraClassPath. The benchmark JAR
+             only needs these for compile. -->
         <dependency>
             <groupId>org.lance</groupId>
             <artifactId>lance-spark-3.5_${scala.compat.version}</artifactId>
@@ -81,7 +87,7 @@
                 <configuration>
                     <archive>
                         <manifest>
-                            <mainClass>org.lance.spark.benchmark.TpcdsBenchmarkRunner</mainClass>
+                            <mainClass>org.lance.spark.benchmark.MergeStrategyBenchmark</mainClass>
                         </manifest>
                     </archive>
                 </configuration>
@@ -96,9 +102,17 @@
                             <goal>shade</goal>
                         </goals>
                         <configuration>
+                            <artifactSet>
+                                <excludes>
+                                    <!-- Provided by the cluster -->
+                                    <exclude>org.apache.spark:*</exclude>
+                                    <exclude>org.scala-lang:*</exclude>
+                                    <exclude>io.netty:*</exclude>
+                                </excludes>
+                            </artifactSet>
                             <transformers>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>org.lance.spark.benchmark.TpcdsBenchmarkRunner</mainClass>
+                                    <mainClass>org.lance.spark.benchmark.MergeStrategyBenchmark</mainClass>
                                 </transformer>
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer" />
                             </transformers>

@@ -79,29 +79,72 @@ public final class MergeStrategyBenchmark {
   private MergeStrategyBenchmark() {}
 
   public static void main(String[] args) throws Exception {
-    Path tmpRoot = Files.createTempDirectory("lance-merge-bench-");
-    System.out.println("Bench root: " + tmpRoot);
+    boolean clusterMode = "true".equalsIgnoreCase(System.getenv("BENCH_CLUSTER_MODE"));
 
-    SparkSession spark = SparkSession.builder()
+    // Cluster mode: caller (cpd-submit-bench.sh) provides BENCH_DATA_PATH;
+    // benchmark uses that as the catalog root so artifacts persist on the
+    // shared volume / abfss bucket. Local mode: synthesize a tmp dir.
+    String rootPath;
+    if (clusterMode) {
+      String envPath = System.getenv("BENCH_DATA_PATH");
+      if (envPath == null || envPath.isEmpty()) {
+        throw new IllegalStateException(
+            "BENCH_CLUSTER_MODE=true requires BENCH_DATA_PATH to be set");
+      }
+      rootPath = envPath;
+    } else {
+      Path tmpRoot = Files.createTempDirectory("lance-merge-bench-");
+      rootPath = tmpRoot.toString();
+    }
+    System.out.println("Bench root: " + rootPath);
+    System.out.println("Cluster mode: " + clusterMode);
+
+    SparkSession.Builder sparkBuilder = SparkSession.builder()
         .appName("merge-strategy-bench")
-        .master("local[*]")
         .config("spark.sql.catalog.lance_ns", "org.lance.spark.LanceNamespaceSparkCatalog")
         .config("spark.sql.catalog.lance_ns.impl", "dir")
-        .config("spark.sql.catalog.lance_ns.root", tmpRoot.toString())
-        .config("spark.sql.shuffle.partitions", "8")
-        .config("spark.sql.adaptive.enabled", "true")
-        .config("spark.ui.enabled", "false")
-        .getOrCreate();
+        .config("spark.sql.catalog.lance_ns.root", rootPath);
+    if (!clusterMode) {
+      // Local: master + UI + shuffle/AQE knobs. On cluster, take whatever
+      // spark-submit configured.
+      sparkBuilder
+          .master("local[*]")
+          .config("spark.sql.shuffle.partitions", "8")
+          .config("spark.sql.adaptive.enabled", "true")
+          .config("spark.ui.enabled", "false");
+    }
+    SparkSession spark = sparkBuilder.getOrCreate();
 
-    // Scales are configurable via -Dbench.scale={smoke|full}. Default = full.
-    String scaleMode = System.getProperty("bench.scale", "full");
-    int[][] scales = scaleMode.equals("smoke")
-        ? new int[][]{{20_000, 20}}
-        : new int[][]{
+    // Scales: -Dbench.scale={smoke|local|huge|cluster}.
+    //  smoke   — single tiny scale (CI / sanity)
+    //  local   — three scales scaled to fit a laptop (default for local runs)
+    //  cluster — three scales scaled for cluster (10M/25K, 50M/50K, 100M/100K rows)
+    //  huge    — single largest scale only (100M rows / 100K fragments)
+    String scaleMode = System.getProperty("bench.scale", clusterMode ? "cluster" : "local");
+    int[][] scales;
+    switch (scaleMode) {
+      case "smoke":
+        scales = new int[][]{{20_000, 20}};
+        break;
+      case "huge":
+        scales = new int[][]{{100_000_000, 100_000}};
+        break;
+      case "cluster":
+        scales = new int[][]{
+            {10_000_000, 10_000},
+            {50_000_000, 50_000},
+            {100_000_000, 100_000}
+        };
+        break;
+      case "local":
+      default:
+        scales = new int[][]{
             {100_000, 100},
             {500_000, 500},
             {2_500_000, 2500}
-          };
+        };
+    }
+    System.out.println("Scale mode: " + scaleMode);
 
     System.out.println();
     System.out.println("scale_rows | scale_frags | path                      | run | wallclock_ms");
@@ -110,14 +153,14 @@ public final class MergeStrategyBenchmark {
     for (int[] s : scales) {
       int totalRows = s[0];
       int targetFragments = s[1];
-      runScale(spark, tmpRoot, totalRows, targetFragments);
+      runScale(spark, totalRows, targetFragments);
     }
 
     spark.stop();
     System.out.println("Done.");
   }
 
-  private static void runScale(SparkSession spark, Path root, int totalRows, int targetFragments)
+  private static void runScale(SparkSession spark, int totalRows, int targetFragments)
       throws Exception {
     int sourceRows = Math.max(100, (int) (((long) totalRows * MERGE_BATCH_FRACTION_PERCENT) / 100));
     int matchedRows = sourceRows / 2;
@@ -178,6 +221,10 @@ public final class MergeStrategyBenchmark {
   /**
    * Seeds table with totalRows of (id INT, value INT, tag STRING). max_rows_per_file
    * forces fragment count proportional to row count so we hit the high-fragment regime.
+   *
+   * Uses spark.range so row generation is distributed across executors and the
+   * driver never holds the materialized rows (driver-side List<Row> blows up
+   * the heap at 50M+).
    */
   private static void seedTable(SparkSession spark, String tblName, int totalRows) {
     spark.sql("DROP TABLE IF EXISTS lance_ns.default." + tblName);
@@ -185,16 +232,11 @@ public final class MergeStrategyBenchmark {
               " (id INT NOT NULL, value INT, tag STRING) " +
               " TBLPROPERTIES ('max_rows_per_file'='" + MAX_ROWS_PER_FILE + "')");
 
-    StructType schema = new StructType()
-        .add("id", DataTypes.IntegerType, false)
-        .add("value", DataTypes.IntegerType, true)
-        .add("tag", DataTypes.StringType, true);
-
-    List<org.apache.spark.sql.Row> rows = new ArrayList<>(totalRows);
-    for (int i = 0; i < totalRows; i++) {
-      rows.add(RowFactory.create(i, i * 10, "tag-" + (i % 100)));
-    }
-    spark.createDataFrame(rows, schema)
+    spark.range(totalRows)
+        .selectExpr(
+            "CAST(id AS INT) AS id",
+            "CAST(id * 10 AS INT) AS value",
+            "CAST(CONCAT('tag-', id % 100) AS STRING) AS tag")
         .write()
         .mode("append")
         .insertInto("lance_ns.default." + tblName);

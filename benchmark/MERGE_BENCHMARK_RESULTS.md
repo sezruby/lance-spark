@@ -22,23 +22,34 @@ matched-update, half not-matched-insert). Tracking issue: `sezruby/lance-spark#8
 
 ## Results
 
+### Local laptop (Apple M5 Max, Spark `local[*]`)
+
 | Total rows | Fragments | SQL `MERGE INTO` median | Native `mergeInsert` median | Speedup |
 |---:|---:|---:|---:|---:|
 | 100,000 | 100 | 190 ms | 7 ms | **27.1×** |
 | 500,000 | 500 | 191 ms | 14 ms | **13.6×** |
-| 2,500,000 | 2500 | 309 ms | 50 ms | **6.2×** |
+| 2,500,000 | 2,500 | 309 ms | 50 ms | **6.2×** |
+
+### CPD stage cluster (4 executors × 4 cores × 16 GB, Spark 3.5)
+
+| Total rows | Fragments | SQL `MERGE INTO` median | Native `mergeInsert` median | Speedup |
+|---:|---:|---:|---:|---:|
+| 10,000,000 | 10,000 | 7,934 ms | 468 ms | **17.0×** |
+| 50,000,000 | 50,000 | 11,185 ms | 2,618 ms | **4.3×** |
+| 100,000,000 | 100,000 | 18,644 ms | 5,331 ms | **3.5×** |
 
 ## Reading the trend
 
-- Native always wins, by 6× to 27× at these scales.
-- Speedup *narrows* as the table grows. At 100K/100, SQL has high constant
-  Catalyst-planning + position-delta-write overhead amortized over little real work;
-  native is essentially free. At 2.5M/2500, native scales linearly with target+source
-  reading and writing, so the absolute gap closes.
-- SQL wall-clock isn't strictly monotonic in fragment count at these scales — Spark's
-  task scheduling at `local[*]` saturates around the 100-fragment point and per-stage
-  overhead dominates more than per-fragment work. On a multi-executor cluster the SQL
-  side would likely scale better; the native side is single-process so won't change.
+- Native wins at every measured scale, from 100K to 100M rows.
+- The gap **narrows as scale grows on the cluster** (17× → 4.3× → 3.5×) but
+  doesn't invert through 100M rows / 100K fragments. SQL benefits from
+  cluster cores; native is single-process. Where SQL overhead dominates
+  (small batches, high fragment count), native is dramatically faster;
+  where target+source reading dominates, native still wins by ~3-4×.
+- For the typical multimodal-merge workload — incremental sync of 1M–100M
+  rows into a Lance table with thousands of fragments — native is the right
+  path. The crossover where SQL's distributed parallelism overtakes native's
+  single-process limit is past the scales tested here.
 
 ## Caveats
 
