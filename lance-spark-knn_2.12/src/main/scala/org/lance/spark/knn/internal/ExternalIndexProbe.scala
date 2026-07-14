@@ -66,6 +66,30 @@ final class ExternalIndexProbe(indexUri: String) extends AutoCloseable {
   }
 
   /**
+   * Batched variant of [[probe]]. Runs all queries in a single JNI call so the underlying
+   * implementation can union per-file refinement reads across queries — collapsing what would
+   * otherwise be N separate cloud-storage fetches per source parquet into one. Use this from
+   * Spark task code that has already collected all left-row queries for the partition.
+   *
+   * Returns one `Seq[SearchResult]` per input query, in input order. Empty rows in the input
+   * are skipped (the corresponding result will be `Seq.empty`).
+   */
+  def probeBatch(
+      queries: Array[Array[Float]],
+      k: Int,
+      nprobes: Int,
+      refineFactor: Int,
+      deletedRids: Array[Byte] = null): IndexedSeq[Seq[SearchResult]] = {
+    require(k > 0, "k must be positive")
+    if (queries.length == 0) return IndexedSeq.empty
+    val batched = index.searchBatch(queries, k, nprobes, refineFactor, deletedRids)
+    val out = new mutable.ArrayBuffer[Seq[SearchResult]](batched.size)
+    val it = batched.iterator()
+    while (it.hasNext) out += it.next().asScala.toSeq
+    out.toIndexedSeq
+  }
+
+  /**
    * Materialize a list of `(filePath, rowIndex)` references with the requested projection
    * columns. Returns a `Seq[Map[String, Any]]` per row in the input order.
    *

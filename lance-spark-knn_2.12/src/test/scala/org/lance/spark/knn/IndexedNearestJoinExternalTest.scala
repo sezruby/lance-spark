@@ -61,6 +61,7 @@ class IndexedNearestJoinExternalTest {
   @AfterEach def teardown(): Unit = {
     if (spark != null) spark.stop()
     org.lance.spark.knn.internal.ExternalIndexLifecycle.clearCacheForTesting()
+    org.lance.spark.knn.internal.ExternalIndexProbeCache.closeAll()
   }
 
   /**
@@ -156,6 +157,64 @@ class IndexedNearestJoinExternalTest {
       hitQueries >= leftVecs.size / 2,
       s"recall too low: only $hitQueries / ${leftVecs.size} queries had ≥ K/2 plausible hits")
     val _unused = truthMap // Ensure variable consistently named even if not used in soft check
+  }
+
+  /**
+   * The per-executor index cache must be functionally transparent: the same join with
+   * `cacheIndexPerExecutor = true` must return byte-identical results to the default per-task
+   * path. Also confirms the cache actually holds a handle after the run and that closeAll drops it
+   * (a cached handle is closed by the cache, never by a task's `finally`).
+   */
+  @Test def perExecutorIndexCacheMatchesUncachedAndManagesLifecycle(): Unit = {
+    val rng = new Random(Seed)
+    val perFile = (0 until NumFiles).map(_ => generateRows(rng, NumRightPerFile, Dim, idOffset = 0))
+    val (leftRows, _) = generateRows(rng, NumLeft, Dim, idOffset = 0)
+    val parquetFiles: Seq[String] = perFile.zipWithIndex.map { case ((rows, _), idx) =>
+      writeParquet(rows, "rid", "rvec", s"cache-part-$idx.parquet")
+    }
+    val leftDf = buildDf(leftRows, "lid", "qvec")
+
+    def runJoin(cache: Boolean): Seq[Row] =
+      IndexedNearestJoinExternal(
+        left = leftDf,
+        rightFilePaths = parquetFiles,
+        leftVecCol = "qvec",
+        rightVecCol = "rvec",
+        k = K,
+        metric = "l2",
+        rightProjection = Some(Seq("rid")),
+        indexParams = Some(
+          ExternalIvfPqIndexParams.builder()
+            .numPartitions(4).numSubVectors(2).numBitsPerSubVector(8)
+            .metric(ExternalIvfPqIndexParams.Metric.L2)
+            .maxIters(10).sampleRate(80).build()),
+        cacheIndexPerExecutor = cache)
+        .collect()
+        .toSeq
+        // Normalize ordering: (lid, score, rid) so the two runs compare regardless of
+        // partition/row emission order.
+        .sortBy(r => (r.getLong(0), r.getFloat(3), r.getLong(2)))
+
+    org.lance.spark.knn.internal.ExternalIndexProbeCache.closeAll()
+    val uncached = runJoin(cache = false)
+    val cached = runJoin(cache = true)
+
+    assertEquals(uncached.size, cached.size, "cached run returned a different row count")
+    uncached.zip(cached).zipWithIndex.foreach { case ((u, c), i) =>
+      assertEquals(u.getLong(0), c.getLong(0), s"lid differs at row $i")
+      assertEquals(u.getLong(2), c.getLong(2), s"rid differs at row $i")
+      assertEquals(u.getFloat(3), c.getFloat(3), 1e-6f, s"score differs at row $i")
+    }
+    // The cache should now hold the one index built for this run.
+    assertTrue(
+      org.lance.spark.knn.internal.ExternalIndexProbeCache.size >= 1,
+      "cache should hold at least one handle after a cached run")
+    // closeAll releases them (idempotent) — mirrors the JVM shutdown hook.
+    org.lance.spark.knn.internal.ExternalIndexProbeCache.closeAll()
+    assertEquals(
+      0,
+      org.lance.spark.knn.internal.ExternalIndexProbeCache.size,
+      "closeAll must empty the cache")
   }
 
   // -- helpers --------------------------------------------------------------------------

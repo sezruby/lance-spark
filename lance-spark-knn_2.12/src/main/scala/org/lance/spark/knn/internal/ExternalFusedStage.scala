@@ -16,7 +16,7 @@ package org.lance.spark.knn.internal
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.types.StructField
-import org.lance.index.external.ParquetRowKey
+import org.lance.index.external.{ParquetRowKey, SearchResult}
 
 import scala.collection.JavaConverters._
 import scala.collection.mutable
@@ -84,7 +84,12 @@ object ExternalFusedStage {
       rightFields: Seq[StructField],
       leftFieldCount: Int,
       outerJoin: Boolean,
-      deletedRids: Array[Byte] = null)
+      deletedRids: Array[Byte] = null,
+      // When true, reuse one open index handle per executor (JVM) across all tasks via
+      // [[ExternalIndexProbeCache]] instead of opening + closing one per task. Amortizes the
+      // index open and the native per-source-parquet metadata warm-up across the executor's
+      // tasks. Default false (per-task open/close, unchanged behavior).
+      cacheIndexPerExecutor: Boolean = false)
     extends Serializable
 
   def run(left: RDD[Row], conf: Conf): RDD[Row] = {
@@ -97,27 +102,60 @@ object ExternalFusedStage {
   private def fusedPartition(iter: Iterator[Row], conf: Conf): Iterator[Row] = {
     if (iter.isEmpty) return Iterator.empty
 
-    val probe = new ExternalIndexProbe(conf.indexUri)
+    // Per-executor cache reuses one open handle across all tasks on this JVM; the handle is then
+    // owned by the cache and must NOT be closed here (closing would free it under sibling tasks).
+    // Per-task mode (default) opens a fresh handle and closes it in the `finally`.
+    val probe =
+      if (conf.cacheIndexPerExecutor) ExternalIndexProbeCache.acquire(conf.indexUri)
+      else new ExternalIndexProbe(conf.indexUri)
     val pathToFileId: Map[String, Int] = conf.filePaths.zipWithIndex.toMap
     val out = mutable.ArrayBuffer.empty[Row]
     try {
-      // Pass 1: probe every left row, collect (leftRow, refs).
-      // Refs from Lance are already SearchResult(filePath, rowIndex, distance) — we
-      // keep them as ScoredFileRowRef so the materialize batch step can group by file.
-      val perLeft = mutable.ArrayBuffer.empty[(Row, Array[ScoredFileRowRef])]
+      // Pass 1: collect every left row + its query vector first, then issue ONE
+      // batched probe call. Batching lets Lance union per-file refinement reads
+      // across all queries in this partition: instead of N per-query parquet
+      // fetches (each ~50 MB at numL=100), one fetch per distinct source file
+      // covers every query's candidates at once. On cloud storage where each
+      // request is dominated by RTT, this turned the per-task budget from
+      // ~50 × 500 ms into ~50 × (probe+pq) + 1 × refine_io.
+      val _ = pathToFileId // file-id sanity is already enforced by Lance
+      val leftRows = mutable.ArrayBuffer.empty[Row]
+      val queryRows = mutable.ArrayBuffer.empty[Array[Float]]
+      val nonEmptyIdx = mutable.ArrayBuffer.empty[Int] // index into leftRows for queries
       iter.foreach { leftRow =>
         val q = LanceProbeStage.extractVector(leftRow, conf.leftVecIdx)
+        leftRows += leftRow
+        if (q != null) {
+          nonEmptyIdx += (leftRows.size - 1)
+          queryRows += q
+        }
+      }
+
+      val batchResults: IndexedSeq[Seq[SearchResult]] =
+        if (queryRows.isEmpty) IndexedSeq.empty
+        else probe.probeBatch(
+          queryRows.toArray,
+          conf.k,
+          conf.nprobes,
+          conf.refineFactor,
+          conf.deletedRids)
+
+      val perLeft = mutable.ArrayBuffer.empty[(Row, Array[ScoredFileRowRef])]
+      val emptyRefs = Array.empty[ScoredFileRowRef]
+      var batchedAt = 0
+      var li = 0
+      while (li < leftRows.size) {
+        val leftRow = leftRows(li)
         val refs: Array[ScoredFileRowRef] =
-          if (q == null) Array.empty[ScoredFileRowRef]
-          else {
-            val results =
-              probe.probe(q, conf.k, conf.nprobes, conf.refineFactor, conf.deletedRids)
+          if (batchedAt < nonEmptyIdx.size && nonEmptyIdx(batchedAt) == li) {
+            val results = batchResults(batchedAt)
+            batchedAt += 1
             results.iterator.map { r =>
-              val _ = pathToFileId // file-id sanity is already enforced by Lance
               ScoredFileRowRef(r.getFilePath, r.getRowIndex, r.getDistance)
             }.toArray
-          }
+          } else emptyRefs
         perLeft += ((leftRow, refs))
+        li += 1
       }
 
       // Pass 2: batched fetch_rows for ALL surviving (file, row) keys across the
@@ -167,7 +205,11 @@ object ExternalFusedStage {
             }
           }
       }
-    } finally probe.close()
+    } finally {
+      // Only close a handle this task owns. Cached handles are closed once by the cache's JVM
+      // shutdown hook, never per task.
+      if (!conf.cacheIndexPerExecutor) probe.close()
+    }
     out.iterator
   }
 

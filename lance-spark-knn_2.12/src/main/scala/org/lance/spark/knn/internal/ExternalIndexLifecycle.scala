@@ -150,6 +150,10 @@ private[knn] object ExternalIndexLifecycle {
     md.update(s"mi=${params.getMaxIters}\n".getBytes("UTF-8"))
     md.update(s"sr=${params.getSampleRate}\n".getBytes("UTF-8"))
     md.update(s"sd=${params.getSeed}\n".getBytes("UTF-8"))
+    // The rerank store changes the on-disk index (adds the sidecar), so it must
+    // partition the cache — otherwise an SQ8 build and a non-SQ8 build over the
+    // same files would collide and wrongly reuse each other's directory.
+    md.update(s"rs=${params.getRerankStore.toString}\n".getBytes("UTF-8"))
     val digest = md.digest()
     val hex = digest.map(b => f"$b%02x").mkString
     // Truncate for friendly directory names; 16 hex = 64 bits of entropy is plenty.

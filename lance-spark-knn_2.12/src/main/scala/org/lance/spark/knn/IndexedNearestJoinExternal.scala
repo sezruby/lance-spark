@@ -88,6 +88,10 @@ object IndexedNearestJoinExternal {
    *                       the metric set from `metric`.
    * @param mergeParallelism number of partitions for the hash-shuffle between probe and
    *                       merge. Defaults to `spark.sql.shuffle.partitions`.
+   * @param cacheIndexPerExecutor when true, reuse one open index handle per executor (JVM)
+   *                       across all tasks instead of opening + closing one per task. Amortizes
+   *                       the index open and native per-source-parquet metadata warm-up. Safe
+   *                       because the native handle is shareable across threads. Default false.
    */
   def apply(
       left: DataFrame,
@@ -102,7 +106,8 @@ object IndexedNearestJoinExternal {
       nprobes: Int = 16,
       refineFactor: Int = 8,
       indexParams: Option[ExternalIvfPqIndexParams] = None,
-      mergeParallelism: Option[Int] = None): DataFrame = {
+      mergeParallelism: Option[Int] = None,
+      cacheIndexPerExecutor: Boolean = false): DataFrame = {
 
     require(k > 0, "k must be positive")
     require(rightFilePaths.nonEmpty, "rightFilePaths must contain at least one path")
@@ -150,7 +155,8 @@ object IndexedNearestJoinExternal {
       rightProjection = rightProjectionCols,
       rightFields = rightProjectedFields,
       leftFieldCount = leftFieldCount,
-      outerJoin = outerJoin)
+      outerJoin = outerJoin,
+      cacheIndexPerExecutor = cacheIndexPerExecutor)
 
     // Repartition `left` before the fused stage so probe + materialize both run with
     // a configurable parallelism, independent of however the user partitioned `left`.
