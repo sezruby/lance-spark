@@ -127,6 +127,36 @@ object ExternalParquetRealDataBenchmark {
       println(s"  rerankStore=$rerankStore  measureRecall=$measureRecall  cacheIndex=$cacheIndex")
       // scalastyle:on println
 
+      // Distributed-build A/B: time the driver-side build vs the executor-distributed build over
+      // the SAME files, and print both. This isolates the build-time win (the ~19min driver scan
+      // at |R|=20M was single-box; distributing fans it across executors). rerank=none only —
+      // the distributed path doesn't build the sidecar yet (it falls back otherwise).
+      if (sys.env.getOrElse("EXT_DISTRIBUTED_BUILD", "false").toBoolean) {
+        import org.lance.spark.knn.internal.{DistributedExternalIndexBuild, ExternalIndexLifecycle}
+        val filesPerTask = sys.env.get("EXT_FILES_PER_TASK").map(_.toInt).getOrElse(1)
+        println("=" * 96)
+        println(
+          s"  Distributed-build A/B (R=${rightFilePaths.size} files, filesPerTask=$filesPerTask)")
+
+        val t0 = System.nanoTime()
+        val driverUri = ExternalIndexLifecycle.buildOrReuse(spark, rightFilePaths, vecCol, params)
+        val driverMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t0)
+        println(f"    driver build:      ${driverMs}%,d ms  -> $driverUri")
+
+        val t1 = System.nanoTime()
+        val distUri = DistributedExternalIndexBuild.build(
+          spark,
+          rightFilePaths,
+          vecCol,
+          params,
+          filesPerTask)
+        val distMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - t1)
+        println(f"    distributed build: ${distMs}%,d ms  -> $distUri")
+        println(f"    speedup: ${driverMs.toDouble / distMs.max(1)}%.2fx")
+        println(s"  [config] distributedBuild R=${rightFilePaths.size} filesPerTask=$filesPerTask")
+        println("=" * 96)
+      }
+
       // One join invocation. `count()` for timing; the DataFrame is also what recall
       // collects from (grouped by lid), so `join()` is shared.
       def join(
