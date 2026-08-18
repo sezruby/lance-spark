@@ -1,0 +1,77 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.lance</groupId>
+        <artifactId>lance-spark-root</artifactId>
+        <version>0.7.1</version>
+        <relativePath>../pom.xml</relativePath>
+    </parent>
+
+    <artifactId>lance-spark-knn_2.13</artifactId>
+    <name>${project.artifactId}</name>
+    <description>Indexed nearest-neighbor join for Lance datasets in Spark</description>
+    <packaging>jar</packaging>
+
+    <properties>
+        <scala.version>${scala213.version}</scala.version>
+        <scala.compat.version>${scala213.compat.version}</scala.compat.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.lance</groupId>
+            <artifactId>lance-spark-base_2.13</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.spark</groupId>
+            <artifactId>spark-sql_${scala.compat.version}</artifactId>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Test-runtime connector so spark.read.format("lance") resolves; see the 2.12 module. -->
+        <dependency>
+            <groupId>org.lance</groupId>
+            <artifactId>lance-spark-3.5_2.13</artifactId>
+            <version>${project.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- junit-jupiter (test) is inherited from the root pom's global dependencies. -->
+    </dependencies>
+
+    <build>
+        <!-- Cross-build: compile the exact same sources as lance-spark-knn_2.12 against Scala 2.13. -->
+        <sourceDirectory>../lance-spark-knn_2.12/src/main/scala</sourceDirectory>
+        <testSourceDirectory>../lance-spark-knn_2.12/src/test/scala</testSourceDirectory>
+        <plugins>
+            <plugin>
+                <groupId>net.alchim31.maven</groupId>
+                <artifactId>scala-maven-plugin</artifactId>
+                <version>${scala-maven-plugin.version}</version>
+                <executions>
+                    <execution>
+                        <id>scala-compile-first</id>
+                        <phase>process-resources</phase>
+                        <goals>
+                            <goal>add-source</goal>
+                            <goal>compile</goal>
+                        </goals>
+                    </execution>
+                    <execution>
+                        <id>scala-test-compile</id>
+                        <phase>process-test-resources</phase>
+                        <goals>
+                            <goal>testCompile</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <args>
+                        <arg>-feature</arg>
+                    </args>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
