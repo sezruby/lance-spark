@@ -14,7 +14,7 @@
 package org.lance.spark.knn.catalyst
 
 import org.apache.spark.sql.{RowFactory, SparkSession}
-import org.apache.spark.sql.catalyst.expressions.{Add, And, Attribute, AttributeSet, EqualTo, Expression, GreaterThan, In, IsNotNull, IsNull, LessThanOrEqual, Literal, Not, Or, VectorCosineSimilarity, VectorInnerProduct, VectorL2Distance}
+import org.apache.spark.sql.catalyst.expressions.{Add, And, Attribute, AttributeSet, EqualTo, Expression, GetStructField, GreaterThan, In, IsNotNull, IsNull, LessThanOrEqual, Literal, Not, Or, VectorCosineSimilarity, VectorInnerProduct, VectorL2Distance}
 import org.apache.spark.sql.catalyst.plans.Inner
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, LogicalPlan, NearestByJoin, Project, SubqueryAlias}
 import org.apache.spark.sql.catalyst.plans.{NearestByDistance, NearestBySimilarity}
@@ -319,7 +319,8 @@ class IndexedNearestByJoinRuleTest {
     val rid = makeAttr("rid", IntegerType)
     val category = makeAttr("category", StringType)
     val bucket = makeAttr("bucket", IntegerType)
-    val attrs = AttributeSet(Seq(rid, category, bucket))
+    val meta = makeAttr("meta", new StructType().add("category", StringType).add("bucket", IntegerType))
+    val attrs = AttributeSet(Seq(rid, category, bucket, meta))
 
     val cases: Seq[(Expression, String)] = Seq(
       EqualTo(category, lit("A")) -> "category = 'A'",
@@ -336,7 +337,9 @@ class IndexedNearestByJoinRuleTest {
       // String-literal escape — single quotes inside the value get doubled.
       EqualTo(category, lit("O'Brien")) -> "category = 'O''Brien'",
       // literal-on-left flip
-      EqualTo(lit(5), bucket) -> "5 = bucket")
+      EqualTo(lit(5), bucket) -> "5 = bucket",
+      // nested struct field access -> dotted path (distinct from the top-level `category` attr)
+      EqualTo(GetStructField(meta, 0, Some("category")), lit("A")) -> "meta.category = 'A'")
     cases.foreach { case (expr, expected) =>
       val got = IndexedNearestByJoinRule.translateFilter(expr, attrs)
       assertEquals(Some(expected), got, s"translation mismatch for: $expr")
@@ -347,6 +350,7 @@ class IndexedNearestByJoinRuleTest {
   @Test def testTranslatorRefusesUnsupportedShapes(): Unit = {
     val rid = makeAttr("rid", IntegerType)
     val ts = makeAttr("ts", DateType) // date literals not in our supported set
+    val foreignMeta = makeAttr("fmeta", new StructType().add("category", StringType))
     val attrs = AttributeSet(Seq(rid, ts))
 
     val rejected: Seq[Expression] = Seq(
@@ -358,7 +362,11 @@ class IndexedNearestByJoinRuleTest {
       // Empty IN list.
       In(rid, Seq.empty),
       // Date literal — out of supported types.
-      EqualTo(ts, Literal(0, DateType)))
+      EqualTo(ts, Literal(0, DateType)),
+      // Nested struct field over a FOREIGN root attr (not in `attrs`) — the recursion must gate
+      // on the root and refuse. (Array/map element access like `col[i]` refuses the same way,
+      // via the translator's catch-all.)
+      EqualTo(GetStructField(foreignMeta, 0, Some("category")), lit("A")))
     rejected.foreach { e =>
       assertEquals(
         None,

@@ -13,7 +13,7 @@
  */
 package org.lance.spark.knn.catalyst
 
-import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeReference, AttributeSet, EqualTo, Expression, GreaterThan, GreaterThanOrEqual, In, IsNotNull, IsNull, LessThan, LessThanOrEqual, Literal, Not, Or, VectorCosineSimilarity, VectorInnerProduct, VectorL2Distance}
+import org.apache.spark.sql.catalyst.expressions.{And, Attribute, AttributeReference, AttributeSet, EqualTo, Expression, GetStructField, GreaterThan, GreaterThanOrEqual, In, IsNotNull, IsNull, LessThan, LessThanOrEqual, Literal, Not, Or, VectorCosineSimilarity, VectorInnerProduct, VectorL2Distance}
 import org.apache.spark.sql.catalyst.plans.{JoinType, LeftOuter, NearestByDirection, NearestByDistance, NearestBySimilarity}
 import org.apache.spark.sql.catalyst.plans.logical.{Filter, LogicalPlan, NearestByJoin, Project, SubqueryAlias}
 import org.apache.spark.sql.catalyst.rules.Rule
@@ -82,7 +82,8 @@ import org.lance.spark.knn.internal.{LanceKnnJoinStage, Metric}
  * for `right WHERE p APPROX NEAREST K`.
  *
  * Translation is conservative: it handles binary comparisons (=, !=, <, <=, >, >=), `IN`,
- * `IS [NOT] NULL`, `AND`/`OR`/`NOT` over right-side attributes vs. literals. Anything else
+ * `IS [NOT] NULL`, `AND`/`OR`/`NOT` over right-side columns (top-level or nested struct fields)
+ * vs. literals. Anything else
  * (UDFs, subqueries, computed expressions) means the rule REFUSES the rewrite and returns the
  * original `NearestByJoin`, falling through to Spark's brute-force cross-product. Refusal — not
  * "push what we can, drop the rest" — because dropping a residual would silently change result
@@ -277,7 +278,9 @@ object IndexedNearestByJoinRule extends Rule[LogicalPlan] {
    * Translate a Spark `Filter` predicate into a Lance SQL filter string. Returns `None` if any
    * sub-expression isn't supported — refusal, not partial pushdown.
    *
-   * Supported shapes (over right-side attributes only):
+   * Supported shapes, where `attr` is a right-side top-level column OR a nested struct field
+   * (the latter rendered as a dotted path `col.field`, arbitrarily deep). Array/map element
+   * access (`col[i]`) is NOT supported and falls through to refusal:
    *   - `attr <op> literal` and `literal <op> attr` for `=`, `!=`, `<`, `<=`, `>`, `>=`
    *   - `attr IS NULL` / `attr IS NOT NULL`
    *   - `attr IN (lit, lit, ...)`  (the IN list must be all foldable literals)
@@ -348,6 +351,13 @@ object IndexedNearestByJoinRule extends Rule[LogicalPlan] {
 
   private def asRightColumn(e: Expression, rightAttrs: AttributeSet): Option[String] = e match {
     case a: Attribute if rightAttrs.contains(a) => Some(a.name)
+    case g: GetStructField =>
+      // Nested struct field: render as a dotted path `col.field` (recursing so `a.b.c` works).
+      // Lance's filter dialect treats a dotted identifier as a nested column path — its scan
+      // planner runs with enable_relations = false — so this maps 1:1. The recursion also gates
+      // on the ROOT resolving to a right-side attribute, so a left-side or foreign root refuses.
+      val fieldName = g.name.getOrElse(g.childSchema(g.ordinal).name)
+      asRightColumn(g.child, rightAttrs).map(base => s"$base.$fieldName")
     case _ => None
   }
 
